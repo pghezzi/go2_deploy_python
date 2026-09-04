@@ -464,9 +464,9 @@ class DepthWaQController(TSController):
             
             
         print("Depth Recived")
-        depth_8u = (self.depth_image * 255).astype(np.uint8)
-        cv2.imshow("Depth Image", depth_8u)
-        cv2.waitKey(1)
+        #depth_8u = (self.depth_image * 255).astype(np.uint8)
+        #cv2.imshow("Depth Image", depth_8u)
+        #cv2.waitKey(1)
 
     def swap_policy(self, index):
         if self.split:
