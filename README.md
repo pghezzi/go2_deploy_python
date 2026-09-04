@@ -40,11 +40,12 @@ This project is an modification of [original python deployment code provided by 
 - scipy
 - pyyaml
 
-Mujoco:
-
-
-
 ## Usage
+
+-Start sim
+   # Start mujoco simulation
+   cd unitree_mujoco/simulate/build
+   ./unitree_mujoco
 
 - TS Controller (sim)
     
