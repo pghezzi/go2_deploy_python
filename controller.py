@@ -34,6 +34,7 @@ class TSController:
         self.qj = np.zeros(config.num_actions, dtype=np.float32)
         self.dqj = np.zeros(config.num_actions, dtype=np.float32)
         self.action = np.zeros(config.num_actions, dtype=np.float32)
+        self._reported_invalid_action = False
         self.target_dof_pos = config.default_angles.copy()
         self.obs_deque = deque(maxlen=config.frame_stack)
         for _ in range(config.frame_stack):
@@ -232,7 +233,7 @@ class TSController:
 
         # imu_state quaternion: w, x, y, z
         quat = self.low_state.imu_state.quaternion
-        ang_vel = np.array([self.low_state.imu_state.gyroscope], dtype=np.float32)
+        ang_vel = np.asarray(self.low_state.imu_state.gyroscope, dtype=np.float32)
         self.euler = self.low_state.imu_state.rpy
 
         # create observation
@@ -287,7 +288,7 @@ class EEController(TSController):
 
         # imu_state quaternion: w, x, y, z
         quat = self.low_state.imu_state.quaternion
-        ang_vel = np.array([self.low_state.imu_state.gyroscope], dtype=np.float32)
+        ang_vel = np.asarray(self.low_state.imu_state.gyroscope, dtype=np.float32)
         self.euler = self.low_state.imu_state.rpy
 
         # create observation
@@ -332,3 +333,264 @@ class EEController(TSController):
 
 class WaQController(TSController):
     pass
+
+
+import cv2
+
+from common.depth_image_idl import DepthImage_
+
+TOPIC_DEPTHIMAGE = "rt/depthimage"
+
+class DepthWaQController(TSController):
+    def __init__(self, config: Config, interface: str) -> None:
+        self.config = config
+        self.remote_controller = RemoteController()
+
+        # Initialize the policy network
+        self.split = config.split
+        if self.split:
+            print("Loading cnn network from:", config.cnn_path)
+            print("Loading actor network from:", config.actor_path)
+            self.depth_cnn = torch.jit.load(config.cnn_path)
+            self.cnn = lambda depth_image: self.depth_cnn(depth_image.unsqueeze(0))
+            self.policy = torch.jit.load(config.actor_path)
+        else:
+            print("Loading policy network from:", config.policy_path)
+            self.policy = torch.jit.load(config.policy_path)
+        # Initializing process variables
+        self.qj = np.zeros(config.num_actions, dtype=np.float32)
+        self.dqj = np.zeros(config.num_actions, dtype=np.float32)
+        self.action = np.zeros(config.num_actions, dtype=np.float32)
+        self._reported_invalid_action = False
+        self.target_dof_pos = config.default_angles.copy()
+        self.obs_deque = deque(maxlen=config.frame_stack)
+        for _ in range(config.frame_stack):
+            self.obs_deque.append(np.zeros(config.num_single_obs, dtype=np.float32))
+        self.cur_obs = np.zeros(config.num_single_obs, dtype=np.float32) # current obs
+        self.euler = np.zeros(3, dtype=np.float32)
+        self.cmd = np.array([0.0, 0, 0])
+
+        # State Machine
+        self.state = "zero_torque"  # initial state
+        state_transition_total_time = 2.0 # seconds
+        self.state_transition_total_steps = int(state_transition_total_time / self.config.control_dt)
+        self.transition2sit_step = 0
+        self.transition2sit_init_dof_pos = np.zeros(self.config.num_actions, dtype=np.float32)
+        self.transition2stand_step = 0
+        self.transition2stand_init_dof_pos = np.zeros(self.config.num_actions, dtype=np.float32)
+        self.control_step_count = 0
+        
+        self.low_cmd = unitree_go_msg_dds__LowCmd_()
+        self.low_state = unitree_go_msg_dds__LowState_()
+
+        self.InitLowCmd()
+        
+        self.lowcmd_publisher_ = ChannelPublisher(config.lowcmd_topic, LowCmdGo)
+        self.lowcmd_publisher_.Init()
+
+        self.lowstate_subscriber = ChannelSubscriber(config.lowstate_topic, LowStateGo)
+        self.lowstate_subscriber.Init(self.LowStateGoHandler, 10)
+
+        self.depth_image = torch.zeros((1, *config.depth_image_shape))
+        self.depth_width = config.depth_image_shape[1]
+        self.depth_height = config.depth_image_shape[0]
+
+        if self.split:
+            self.visual_latent = self.cnn(self.depth_image)
+        else:
+            self.visual_latent = self.depth_image.unsqueeze(0)
+        self.active_lora_index = -1
+
+        self.depth_subscriber = ChannelSubscriber(TOPIC_DEPTHIMAGE, DepthImage_)
+        self.depth_subscriber.Init(self.DepthImageHandler, 1)
+        
+        if interface != "lo":
+            # Disable MCF mode to enable custom control
+            self.sport_client = SportClient()
+            self.sport_client.SetTimeout(5.0)
+            self.sport_client.Init()
+            
+            self.motion_switcher_client = MotionSwitcherClient()
+            self.motion_switcher_client.SetTimeout(5.0)
+            self.motion_switcher_client.Init()
+            
+            status, result = self.motion_switcher_client.CheckMode()
+            while result['name']:
+                self.sport_client.StandDown()
+                self.motion_switcher_client.ReleaseMode()
+                status, result = self.motion_switcher_client.CheckMode()
+                time.sleep(1.0)
+            
+            print("Release mcf mode")
+        
+        self.lowCmdThread = RecurrentThread(
+            interval=self.config.communication_dt, 
+            target=self.LowCmdHandler,
+            name="LowCmdThread")
+        self.lowCmdThread.Start()
+        
+        self.mainControlThread = RecurrentThread(
+            interval=self.config.control_dt,
+            target=self.mainControlStep,
+            name="MainControlThread")
+        self.mainControlThread.Start()
+
+        if self.split:
+            self.cnnThread = RecurrentThread(
+                        interval=self.config.control_dt*5, 
+                        target=self.LowCmdHandler,
+                        name="LowCmdThread")
+            self.cnnThread.Start()
+
+    def cnnHandler(self):
+        self.visual_latent = self.cnn(self.depth_image)
+    
+    def DepthImageHandler(self, msg: DepthImage_):
+        depth = np.asarray(msg.normalized_value, dtype=np.float32)
+        expected_height, expected_width = self.config.depth_image_shape
+        expected_size = expected_height * expected_width
+        if (msg.height, msg.width) != (expected_height, expected_width) or depth.size != expected_size:
+            print(
+                "Ignoring depth image with unexpected shape "
+                f"{msg.height}x{msg.width}; expected {expected_height}x{expected_width}."
+            )
+            return
+        self.depth_image = torch.from_numpy(
+            depth.reshape(expected_height, expected_width)
+        ).unsqueeze(0)
+        if not self.split:
+            self.visual_latent = self.depth_image.unsqueeze(0)
+        
+            
+            
+        print("Depth Recived")
+        depth_8u = (self.depth_image * 255).astype(np.uint8)
+        cv2.imshow("Depth Image", depth_8u)
+        cv2.waitKey(1)
+
+    def swap_policy(self, index):
+        if self.split:
+            self.depth_cnn.swap(index)
+        self.policy.swap(index)
+        self.active_lora_index = index
+        if self.split:
+            self.visual_latent = self.cnn(self.depth_image)
+        print(f"Switched depth policy to {index}")
+
+    def updateStateMachine(self):
+            if self.remote_controller.button[KeyMap.L1].pressed and self.remote_controller.button[KeyMap.left].on_press:
+                self.swap_policy(-1)
+            elif self.remote_controller.button[KeyMap.L1].pressed and self.remote_controller.button[KeyMap.right].on_press:
+                self.swap_policy((self.active_lora_index + 1) % self.config.num_loras)
+            elif self.remote_controller.button[KeyMap.L1].pressed and self.remote_controller.button[KeyMap.R1].on_press:
+                if self.state == "damping": # damping to sit
+                    print("Moving to sit pos.")
+                    # record the current pos
+                    dof_idx = self.config.leg_joint2motor_idx
+                    for i in range(self.config.num_actions):
+                        self.transition2sit_init_dof_pos[i] = self.low_state.motor_state[dof_idx[i]].q
+                    # reset step counter
+                    self.transition2sit_step = 0
+                    self.state = "sit"
+                else:
+                    raise NotImplementedError("Cannot transition from damping to states other than sit.")
+            elif self.remote_controller.button[KeyMap.L1].pressed and self.remote_controller.button[KeyMap.R2].on_press:
+                if self.state == "sit": # sit to stand
+                    print("Moving to stand pos.")
+                    # record the current pos
+                    dof_idx = self.config.leg_joint2motor_idx
+                    for i in range(self.config.num_actions):
+                        self.transition2stand_init_dof_pos[i] = self.low_state.motor_state[dof_idx[i]].q
+                    # reset step counter
+                    self.transition2stand_step = 0
+                    self.state = "stand"
+                    print("here")
+                else:
+                    raise NotImplementedError("Cannot transition from sit to states other than stand.")
+            elif self.remote_controller.button[KeyMap.L1].pressed and self.remote_controller.button[KeyMap.A].on_press:
+                if self.state == "stand": # stand to ctrl
+                    print("Entering control state.")
+                    self.state = "ctrl"
+                else:
+                    raise NotImplementedError("Cannot transition from stand to states other than ctrl.")
+            elif self.remote_controller.button[KeyMap.L1].pressed and self.remote_controller.button[KeyMap.Y].on_press:
+                print("Enter damping state.")
+                self.state = "damping"
+                # back to damping from any state
+            elif self.remote_controller.button[KeyMap.L1].pressed and self.remote_controller.button[KeyMap.X].on_press:
+                if self.state == "damping":
+                    print("Enter zero torque state.")
+                    self.state = "zero_torque"
+                else:
+                    raise NotImplementedError("Can only enter zero torque state from damping state.")
+            else:
+                pass
+
+    def calculate(self):
+        # Get the current joint position and velocity
+        for i in range(len(self.config.leg_joint2motor_idx)):
+            self.qj[i] = self.low_state.motor_state[self.config.leg_joint2motor_idx[i]].q
+            self.dqj[i] = self.low_state.motor_state[self.config.leg_joint2motor_idx[i]].dq
+
+        # imu_state quaternion: w, x, y, z
+        quat = self.low_state.imu_state.quaternion
+        ang_vel = np.asarray(self.low_state.imu_state.gyroscope, dtype=np.float32)
+        self.euler = self.low_state.imu_state.rpy
+
+        # create observation
+        gravity_orientation = get_gravity_orientation(quat)
+        qj_obs = self.qj.copy()
+        dqj_obs = self.dqj.copy()
+        qj_obs = (qj_obs - self.config.default_angles) * self.config.dof_pos_scale
+        dqj_obs = dqj_obs * self.config.dof_vel_scale
+        ang_vel = ang_vel * self.config.ang_vel_scale
+
+        self.cmd[0] = self.remote_controller.ly
+        self.cmd[1] = self.remote_controller.lx * -1
+        self.cmd[2] = self.remote_controller.rx * -1
+
+        commands = self.cmd  * self.config.max_cmd * self.config.cmd_scale
+
+        num_actions = self.config.num_actions
+        self.cur_obs[:3] = commands
+        self.cur_obs[3:6] = gravity_orientation
+        self.cur_obs[6:9] = ang_vel
+        self.cur_obs[9 : 9 + num_actions] = qj_obs
+        self.cur_obs[9 + num_actions : 9 + num_actions * 2] = dqj_obs
+        self.cur_obs[9 + num_actions * 2 : 9 + num_actions * 3] = self.action
+        
+        self.obs_deque.append(self.cur_obs.copy())
+        self.obs_history = np.concatenate([self.obs_deque[i] for i in range(len(self.obs_deque))], axis=0)
+
+        # Get the action from the policy network
+        cur_obs_tensor = torch.from_numpy(self.cur_obs).unsqueeze(0)
+        obs_history_tensor = torch.from_numpy(self.obs_history).unsqueeze(0)
+        visual_latent = self.visual_latent
+
+        policy_action = self.policy(
+            cur_obs_tensor, obs_history_tensor, visual_latent
+        ).detach().numpy().squeeze()
+        if not np.all(np.isfinite(policy_action)):
+            if not self._reported_invalid_action:
+                print("Invalid depth-policy action; commanding the neutral pose.")
+                self._reported_invalid_action = True
+            self.action.fill(0.0)
+        else:
+            self.action = np.clip(
+                policy_action, -self.config.action_clip, self.config.action_clip
+            ).astype(np.float32)
+        
+        # transform action to target_dof_pos
+        target_dof_pos = self.config.default_angles + self.action * self.config.action_scale
+
+        # Build low cmd
+        for i in range(len(self.config.leg_joint2motor_idx)):
+            motor_idx = self.config.leg_joint2motor_idx[i]
+            #self.low_cmd.motor_cmd[motor_idx].q = target_dof_pos[i]
+            self.low_cmd.motor_cmd[motor_idx].q = self.config.default_angles[i]
+            self.low_cmd.motor_cmd[motor_idx].dq = 0
+            #self.low_cmd.motor_cmd[motor_idx].kp = self.config.ctrl_kp
+            self.low_cmd.motor_cmd[motor_idx].kp = self.config.stand_kp
+            #self.low_cmd.motor_cmd[motor_idx].kd = self.config.ctrl_kd
+            self.low_cmd.motor_cmd[motor_idx].kd = self.config.stand_kd
+            self.low_cmd.motor_cmd[motor_idx].tau = 0

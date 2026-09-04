@@ -14,6 +14,14 @@ class Config:
             self.lowstate_topic = config["lowstate_topic"]
             self.policy_path = config["policy_path"]
 
+            self.split = config.get("split", False)
+            self.cnn_path = config.get("cnn_path", None)
+            self.actor_path = config.get("actor_path", None)
+            self.depth_image_shape = config.get("depth_image_shape", [48, 64])
+            self.num_loras = config.get("num_loras", 0)
+            self.action_clip = config.get("action_clip", 10.0)
+
+
             self.leg_joint2motor_idx = config["leg_joint2motor_idx"]
             self.stand_kp = config["stand_kp"]
             self.stand_kd = config["stand_kd"]

@@ -26,6 +26,8 @@ if __name__ == "__main__":
         controller = EEController(config, args.interface)
     elif args.type == "waq":
         controller = WaQController(config, args.interface)
+    elif args.type == "depthwaq":
+        controller = DepthWaQController(config, args.interface)
     else:
         raise ValueError(f"Unsupported controller type: {args.type}")
     
