@@ -12,27 +12,7 @@ This project is an modification of [original python deployment code provided by 
    sudo make install
    ```
 
-2. Install [LibTorch](https://pytorch.org/)
-   ```bash
-   # For Nvidia Jetson
-   wget https://download.pytorch.org/libtorch/cu118/libtorch-cxx11-abi-shared-with-deps-2.7.1%2Bcu118.zip # modify cuda version
-   # For x86_64 PC
-   wget https://download.pytorch.org/libtorch/cpu/libtorch-shared-with-deps-2.8.0%2Bcpu.zip
-
-   # unzip the file and get libtorch folder
-   # the CMAKE_PREFIX_PATH in CMakeLists.txt should be modified according to your installation path of libtorch
-   set(CMAKE_PREFIX_PATH /home/username/libtorch)     # in CMakeLists.txt
-   ```
-
-3. Clone this repo and compile
-   ```bash
-   # clone the repo
-   git clone https://github.com/lupinjia/go2_deploy.git
-   mkdir build && cd build
-   cmake .. && make
-   ```
-
-4. Clone unitree_mujoco and compile (for simulation in mujoco)
+2. Clone unitree_mujoco and compile (for simulation in mujoco)
    
    1. install mujoco
       ```bash
@@ -55,9 +35,7 @@ This project is an modification of [original python deployment code provided by 
       make -j4
       ```
 
-## Installation
-
-- [unitree_sdk2_python](https://github.com/unitreerobotics/unitree_sdk2_python)
+3. Install via pip
 - [pytorch](https://pytorch.org/)
 - scipy
 - pyyaml
