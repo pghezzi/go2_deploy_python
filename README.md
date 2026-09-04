@@ -18,7 +18,7 @@ This project is an modification of [original python deployment code provided by 
       ```bash
       sudo apt install libglfw3-dev libxinerama-dev libxcursor-dev libxi-dev
 
-      git clone https://github.com/google-deepmind/mujoco.git](https://github.com/pghezzi/mujoco/tree/fixes
+      git clone https://github.com/pghezzi/mujoco/tree/fixes
       mkdir build && cd build
       cmake ..
       make -j4
