@@ -812,7 +812,7 @@ class DepthWaQController(TSController):
 
         # The observation must contain the action actually sent to the motors,
         # expressed in the policy's normalized action units.
-        self.action = limited_action_offset / self.config.action_scale
+        self.action = policy_action
         target_dof_pos = self.config.default_angles + limited_action_offset
 
         # Build low cmd
