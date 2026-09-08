@@ -350,6 +350,16 @@ class DepthWaQController(TSController):
         self.config = config
         self.remote_controller = RemoteController()
 
+        # Configure this before invoking either TorchScript model. Without a
+        # cap, concurrent actor/CNN forwards can oversubscribe the robot CPU.
+        torch.set_num_threads(config.torch_num_threads)
+        try:
+            torch.set_num_interop_threads(config.torch_num_interop_threads)
+        except RuntimeError as error:
+            # This setting is process-global and can only be set before Torch
+            # begins inter-op work. Retain the runtime default if it is late.
+            print(f"Warning: could not set PyTorch inter-op threads: {error}")
+
         # Initialize the policy network
         self.split = config.split
         if self.split:
@@ -389,6 +399,9 @@ class DepthWaQController(TSController):
         self._last_timing_log_time = time.monotonic()
         self._inference_interval_s = None
         self._cnn_interval_s = None
+        self._inference_duration_s = None
+        self._actor_forward_duration_s = None
+        self._cnn_duration_s = None
         self._timing_log_path = Path(config.timing_log_path)
         self._timing_log_path.parent.mkdir(parents=True, exist_ok=True)
         with self._timing_log_path.open("a", encoding="utf-8") as timing_log:
@@ -471,21 +484,26 @@ class DepthWaQController(TSController):
             self.cnnThread.Start()
 
     def cnnHandler(self):
+        start = time.perf_counter()
         self.visual_latent = self.cnn(self.depth_image)
-        self._record_timing("cnn")
+        self._record_timing("cnn", time.perf_counter() - start)
 
-    def _record_timing(self, task):
-        """Log observed policy/CNN completion intervals at a bounded rate."""
+    def _record_timing(self, task, duration_s, forward_duration_s=None):
+        """Log model execution time and completion intervals at a bounded rate."""
         now = time.monotonic()
+        timing_line = None
         with self._timing_lock:
             if task == "inference":
                 if self._last_inference_time is not None:
                     self._inference_interval_s = now - self._last_inference_time
                 self._last_inference_time = now
+                self._inference_duration_s = duration_s
+                self._actor_forward_duration_s = forward_duration_s
             elif task == "cnn":
                 if self._last_cnn_time is not None:
                     self._cnn_interval_s = now - self._last_cnn_time
                 self._last_cnn_time = now
+                self._cnn_duration_s = duration_s
             else:
                 raise ValueError(f"Unknown timing task: {task}")
 
@@ -500,15 +518,26 @@ class DepthWaQController(TSController):
                     f"({1.0 / interval_s:.1f} Hz; target {target_hz:.1f} Hz)"
                 )
 
+            def format_duration(duration_s):
+                return "waiting" if duration_s is None else f"{duration_s * 1000.0:.2f} ms"
+
             timing_line = (
-                f"{time.strftime('%Y-%m-%d %H:%M:%S')} [Timing] inference: "
+                f"{time.strftime('%Y-%m-%d %H:%M:%S')} [Timing] "
+                "actor completion interval: "
                 f"{format_interval(self._inference_interval_s, self.config.inference_rate_hz)}; "
-                "CNN: "
-                f"{format_interval(self._cnn_interval_s, self.config.cnn_rate_hz)}"
+                f"actor step: {format_duration(self._inference_duration_s)}; "
+                f"actor forward: {format_duration(self._actor_forward_duration_s)}; "
+                "CNN completion interval: "
+                f"{format_interval(self._cnn_interval_s, self.config.cnn_rate_hz)}; "
+                f"CNN forward: {format_duration(self._cnn_duration_s)}"
             )
+            self._last_timing_log_time = now
+
+        # Disk I/O must not block the actor or CNN thread while it holds the
+        # shared timing lock.
+        if timing_line is not None:
             with self._timing_log_path.open("a", encoding="utf-8") as timing_log:
                 timing_log.write(timing_line + "\n")
-            self._last_timing_log_time = now
     
     def DepthImageHandler(self, msg: DepthImage_):
         depth = np.asarray(msg.normalized_value, dtype=np.float32)
@@ -688,6 +717,7 @@ class DepthWaQController(TSController):
 
     
     def calculate(self):
+        step_start = time.perf_counter()
         # Get the current joint position and velocity
         for i in range(len(self.config.leg_joint2motor_idx)):
             self.qj[i] = self.low_state.motor_state[self.config.leg_joint2motor_idx[i]].q
@@ -755,9 +785,11 @@ class DepthWaQController(TSController):
         #    obs_history_tensor,
         #    visual_latent,
         #).detach().squeeze(0)
+        policy_start = time.perf_counter()
         policy_action = self.policy(
             cur_obs_tensor, obs_history_tensor, visual_latent
         ).detach().numpy().squeeze()
+        actor_forward_duration = time.perf_counter() - policy_start
 
         if not np.all(np.isfinite(policy_action)):
             if not self._reported_invalid_action:
@@ -796,4 +828,8 @@ class DepthWaQController(TSController):
             #self.low_cmd.motor_cmd[motor_idx].kd = self.config.ctrl_kd
             #self.low_cmd.motor_cmd[motor_idx].tau = 0
 
-        self._record_timing("inference")
+        self._record_timing(
+            "inference",
+            time.perf_counter() - step_start,
+            actor_forward_duration,
+        )

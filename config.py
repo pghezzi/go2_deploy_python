@@ -19,12 +19,21 @@ class Config:
             self.timing_log_path = config.get(
                 "timing_log_path", "logs/depthwaq_timing.log"
             )
+            # Keep PyTorch from creating a worker pool per concurrent model
+            # thread. This matters on the robot, where the actor, depth CNN,
+            # DDS callbacks, and camera pipeline share CPUs.
+            self.torch_num_threads = int(config.get("torch_num_threads", 1))
+            self.torch_num_interop_threads = int(
+                config.get("torch_num_interop_threads", 1)
+            )
             if (
                 self.inference_rate_hz <= 0
                 or self.cnn_rate_hz <= 0
                 or self.timing_log_interval_s <= 0
+                or self.torch_num_threads <= 0
+                or self.torch_num_interop_threads <= 0
             ):
-                raise ValueError("Inference, CNN, and timing-log rates must be positive.")
+                raise ValueError("Timing rates and PyTorch thread counts must be positive.")
             if not np.isclose(self.control_dt, 1.0 / self.inference_rate_hz):
                 raise ValueError(
                     "control_dt must equal 1 / inference_rate_hz so action limits "
