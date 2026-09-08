@@ -32,6 +32,7 @@ fi
 
 depth_pid=""
 controller_pid=""
+depth_log="/tmp/depthwaq_depth_publisher.log"
 
 cleanup() {
     trap - EXIT INT TERM
@@ -46,8 +47,8 @@ trap 'exit 130' INT TERM
 
 cd "$script_dir"
 
-echo "Starting RealSense depth publisher..."
-"$python_bin" rough_depth_image.py &
+echo "Starting RealSense depth publisher (logging to $depth_log)..."
+"$python_bin" rough_depth_image.py >"$depth_log" 2>&1 &
 depth_pid=$!
 
 echo "Starting DepthWaQ controller on $interface with $config_name..."
