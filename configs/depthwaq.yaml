@@ -6,9 +6,9 @@ lowcmd_topic: "rt/lowcmd"
 lowstate_topic: "rt/lowstate"
 
 split: True
-policy_path: "/home/oscaryoungquist/fft_jit_model/compiled_fft_20260903_225643.pt"
-cnn_path: "/home/oscaryoungquist/fft_jit_model/compiled_fft_20260903_225643_split/DepthCNN.pt"
-actor_path: "/home/oscaryoungquist/fft_jit_model/compiled_fft_20260903_225643_split/FeaturesWaQ.pt"
+policy_path: "./models/fft_jit_model/compiled_fft_20260903_225643.pt"
+cnn_path: "./models/fft_jit_model/compiled_fft_20260903_225643_split/DepthCNN.pt"
+actor_path: "./models/fft_jit_model/compiled_fft_20260903_225643_split/FeaturesWaQ.pt"
 depth_image_shape: [48, 64]
 num_loras: 3
 action_clip: 10.0

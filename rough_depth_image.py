@@ -4,7 +4,7 @@ import cv2
 import pyrealsense2 as rs
 
 from unitree_sdk2py.core.channel import ChannelPublisher, ChannelFactoryInitialize
-from depth_image_idl import DepthImage_
+from common.depth_image_idl import DepthImage_
 
 TOPIC_DEPTHIMAGE = "rt/depthimage"
 

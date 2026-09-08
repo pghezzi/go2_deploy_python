@@ -336,6 +336,9 @@ class WaQController(TSController):
 
 
 import cv2
+import os
+
+HAS_DISPLAY = os.environ.get("DISPLAY")
 
 from common.depth_image_idl import DepthImage_
 
@@ -475,17 +478,15 @@ class DepthWaQController(TSController):
 
         if not self.split:
             self.visual_latent = self.depth_image.unsqueeze(0)
-
-        # -----------------------------
-        # Display depth image with OpenCV
-        # -----------------------------
-        depth_np = self.depth_image.squeeze(0).numpy()
-
-        # normalized_value is assumed to be [0, 1]
-        depth_8u = np.clip(depth_np * 255.0, 0, 255).astype(np.uint8)
-
-        cv2.imshow("Depth Image", depth_8u)
-        cv2.waitKey(1)
+        
+        if HAS_DISPLAY:
+            # -----------------------------
+            # Display depth image with OpenCV
+            # -----------------------------
+            depth_np = self.depth_image.squeeze(0).numpy()
+            depth_8u = np.clip(depth_np * 255.0, 0, 255).astype(np.uint8)
+            cv2.imshow("Depth Image", depth_8u)
+            cv2.waitKey(1)
 
         #print("Depth Received")
 
@@ -731,18 +732,12 @@ class DepthWaQController(TSController):
         target_dof_pos = self.config.default_angles + limited_action_offset
 
         # Build low cmd
-        for i in range(len(self.config.leg_joint2motor_idx)):
-            #motor_idx = self.config.leg_joint2motor_idx[i]
-            #self.low_cmd.motor_cmd[motor_idx].q = target_dof_pos[i]
-            ##self.low_cmd.motor_cmd[motor_idx].q = self.config.default_angles[i]
-            ##self.low_cmd.motor_cmd[motor_idx].dq = 0
+        for i, motor_idx in enumerate(self.config.leg_joint2motor_idx):
+            #self.low_cmd.motor_cmd[motor_idx].q = self.config.default_angles[i]
             #self.low_cmd.motor_cmd[motor_idx].dq = 0
-            #self.low_cmd.motor_cmd[motor_idx].kp = self.config.ctrl_kp
-            ##self.low_cmd.motor_cmd[motor_idx].kp = self.config.stand_kp
-            #self.low_cmd.motor_cmd[motor_idx].kd = self.config.ctrl_kd
-            ##self.low_cmd.motor_cmd[motor_idx].kd = self.config.stand_kd
-            #self.low_cmd.motor_cmd[motor_idx].tau = 0
-            motor_idx = self.config.leg_joint2motor_idx[i]
+            #self.low_cmd.motor_cmd[motor_idx].kp = self.config.stand_kp
+            #self.low_cmd.motor_cmd[motor_idx].kd = self.config.stand_kd
+
             self.low_cmd.motor_cmd[motor_idx].q = target_dof_pos[i]
             self.low_cmd.motor_cmd[motor_idx].dq = 0
             self.low_cmd.motor_cmd[motor_idx].kp = self.config.ctrl_kp
