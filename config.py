@@ -20,6 +20,21 @@ class Config:
             self.depth_image_shape = config.get("depth_image_shape", [48, 64])
             self.num_loras = config.get("num_loras", 0)
             self.action_clip = config.get("action_clip", 10.0)
+            command_ranges = config.get("command_ranges", {})
+            self.command_ranges = {}
+            for policy_index, bounds in command_ranges.items():
+                lower = np.array(bounds["lower"], dtype=np.float32)
+                upper = np.array(bounds["upper"], dtype=np.float32)
+                if (
+                    lower.shape != (3,)
+                    or upper.shape != (3,)
+                    or np.any(lower > upper)
+                ):
+                    raise ValueError(
+                        f"Command bounds for policy {policy_index} must be "
+                        "three-element vectors with lower <= upper."
+                    )
+                self.command_ranges[int(policy_index)] = (lower, upper)
             self.torque_limits = np.array(
                 config.get("torque_limits", [23.0, 23.0, 40.0] * 4),
                 dtype=np.float32,
@@ -49,3 +64,12 @@ class Config:
             self.num_actions = config["num_actions"]
             self.num_single_obs = config["num_single_obs"]
             self.frame_stack = config["frame_stack"]
+
+    def command_bounds(self, policy_index):
+        """Return the unscaled training bounds for a base or LoRA policy."""
+        try:
+            return self.command_ranges[policy_index]
+        except KeyError as exc:
+            raise ValueError(
+                f"No command range configured for policy index {policy_index}."
+            ) from exc

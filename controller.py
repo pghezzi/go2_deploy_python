@@ -653,11 +653,32 @@ class DepthWaQController(TSController):
         dqj_obs = dqj_obs * self.config.dof_vel_scale
         ang_vel = ang_vel * self.config.ang_vel_scale
 
-        self.cmd[0] = self.remote_controller.ly
-        self.cmd[1] = self.remote_controller.lx * -1
-        self.cmd[2] = self.remote_controller.rx * -1
+        raw_command = np.array(
+            [
+                self.remote_controller.ly,
+                -self.remote_controller.lx,
+                -self.remote_controller.rx,
+            ],
+            dtype=np.float32,
+        )
+        # Never feed NaN/Inf or out-of-distribution joystick commands to the
+        # policy. The configured bounds are the unscaled training ranges.
+        command_lower, command_upper = self.config.command_bounds(
+            self.active_lora_index
+        )
+        raw_command = np.nan_to_num(
+            raw_command,
+            nan=0.0,
+            posinf=command_upper,
+            neginf=command_lower,
+        )
+        self.cmd = np.clip(
+            raw_command,
+            command_lower,
+            command_upper,
+        )
 
-        commands = self.cmd  * self.config.max_cmd * self.config.cmd_scale
+        commands = self.cmd * self.config.max_cmd * self.config.cmd_scale
 
         num_actions = self.config.num_actions
         self.cur_obs[:3] = commands
@@ -698,17 +719,15 @@ class DepthWaQController(TSController):
 
         # limit_position_actions expects position offsets from default_angles.
         # Convert normalized policy actions to offsets before limiting.
-        self.action = policy_action
-
         action_offset = torch.from_numpy(
             policy_action * self.config.action_scale
         ).float()
-        #limited_action_offset = self.limit_position_actions(action_offset)
-        #limited_action_offset = limited_action_offset.detach().cpu().numpy()
-        limited_action_offset = action_offset.detach().cpu().numpy()
+        limited_action_offset = self.limit_position_actions(action_offset)
+        limited_action_offset = limited_action_offset.detach().cpu().numpy()
 
-        # Preserve normalized actions in the policy observation history.
-        # self.action = limited_action_offset
+        # The observation must contain the action actually sent to the motors,
+        # expressed in the policy's normalized action units.
+        self.action = limited_action_offset / self.config.action_scale
         target_dof_pos = self.config.default_angles + limited_action_offset
 
         # Build low cmd

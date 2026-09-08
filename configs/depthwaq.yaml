@@ -12,6 +12,15 @@ actor_path: "/home/oscaryoungquist/fft_jit_model/compiled_fft_20260903_225643_sp
 depth_image_shape: [48, 64]
 num_loras: 3
 action_clip: 10.0
+# Unscaled commands: [forward m/s, lateral m/s, yaw rad/s]. Each key is the
+# active policy index: -1 is the base policy; 0/1/2 map to gap/all_stairs/pit.
+# All current policies were trained with this non-baseline profile after its
+# forward-speed curriculum reached 1.5 m/s.
+command_ranges:
+  "-1": {lower: [-1.0, -1.0, -1.0], upper: [1.5, 1.0, 1.0]}
+  "0": {lower: [0.0, 0.0, -1.0], upper: [1.5, 0.0, 1.0]} # gap
+  "1": {lower: [0.0, 0.0, -1.0], upper: [1.5, 0.0, 1.0]} # all_stairs
+  "2": {lower: [0.0, 0.0, -1.0], upper: [1.5, 0.0, 1.0]} # pit
 torque_limits: [23.0, 23.0, 40.0, 23.0, 23.0, 40.0, 23.0, 23.0, 40.0, 23.0, 23.0, 40.0]
 qd_rate_limits: [8.0, 12.0, 16.0, 8.0, 12.0, 16.0, 8.0, 12.0, 16.0, 8.0, 12.0, 16.0]
 torque_slew_limits: 500.0
