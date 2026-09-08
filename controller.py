@@ -94,7 +94,7 @@ class TSController:
             target=self.mainControlStep,
             name="MainControlThread")
         self.mainControlThread.Start()
-    
+
     def InitLowCmd(self):
         self.low_cmd.head[0]=0xFE
         self.low_cmd.head[1]=0xEF
@@ -368,7 +368,17 @@ class DepthWaQController(TSController):
             self.obs_deque.append(np.zeros(config.num_single_obs, dtype=np.float32))
         self.cur_obs = np.zeros(config.num_single_obs, dtype=np.float32) # current obs
         self.euler = np.zeros(3, dtype=np.float32)
-        self.cmd = np.array([0.0, 0, 0])
+        self.cmd = np.array([0.0, 0.0, 0.0])
+
+        self.torque_limits = torch.from_numpy(config.torque_limits)
+        self.qd_rate_limits = torch.from_numpy(config.qd_rate_limits)
+        self.torque_slew_limits = config.torque_slew_limits
+
+        # This tracks position offsets from the default pose, matching the
+        # input/output convention of limit_position_actions().
+        self.prev_actions_scaled = torch.zeros(config.num_actions)
+        self.prev_pd_torque = torch.zeros((12))
+
 
         # State Machine
         self.state = "zero_torque"  # initial state
@@ -437,9 +447,9 @@ class DepthWaQController(TSController):
 
         if self.split:
             self.cnnThread = RecurrentThread(
-                        interval=self.config.control_dt*5, 
-                        target=self.LowCmdHandler,
-                        name="LowCmdThread")
+                        interval=self.config.control_dt * 5,
+                        target=self.cnnHandler,
+                        name="DepthCNNThread")
             self.cnnThread.Start()
 
     def cnnHandler(self):
@@ -447,26 +457,37 @@ class DepthWaQController(TSController):
     
     def DepthImageHandler(self, msg: DepthImage_):
         depth = np.asarray(msg.normalized_value, dtype=np.float32)
+
         expected_height, expected_width = self.config.depth_image_shape
         expected_size = expected_height * expected_width
+
         if (msg.height, msg.width) != (expected_height, expected_width) or depth.size != expected_size:
             print(
                 "Ignoring depth image with unexpected shape "
                 f"{msg.height}x{msg.width}; expected {expected_height}x{expected_width}."
             )
             return
+
+        # Shape: [1, H, W]
         self.depth_image = torch.from_numpy(
             depth.reshape(expected_height, expected_width)
         ).unsqueeze(0)
+
         if not self.split:
             self.visual_latent = self.depth_image.unsqueeze(0)
-        
-            
-            
-        print("Depth Recived")
-        #depth_8u = (self.depth_image * 255).astype(np.uint8)
-        #cv2.imshow("Depth Image", depth_8u)
-        #cv2.waitKey(1)
+
+        # -----------------------------
+        # Display depth image with OpenCV
+        # -----------------------------
+        depth_np = self.depth_image.squeeze(0).numpy()
+
+        # normalized_value is assumed to be [0, 1]
+        depth_8u = np.clip(depth_np * 255.0, 0, 255).astype(np.uint8)
+
+        cv2.imshow("Depth Image", depth_8u)
+        cv2.waitKey(1)
+
+        #print("Depth Received")
 
     def swap_policy(self, index):
         if self.split:
@@ -526,6 +547,93 @@ class DepthWaQController(TSController):
             else:
                 pass
 
+    def limit_position_actions(self, actions_scaled):
+        qj = torch.from_numpy(self.qj).float()
+        dqj = torch.from_numpy(self.dqj).float()
+        default_angles = torch.from_numpy(
+            self.config.default_angles
+        ).float()
+        kp = torch.as_tensor(self.config.ctrl_kp, dtype=torch.float32)
+        kd = torch.as_tensor(self.config.ctrl_kd, dtype=torch.float32)
+
+        # ----- 1. Absolute PD torque bounds -----
+        torque_low = -self.torque_limits
+        torque_high = self.torque_limits
+
+        abs_low = (
+            (torque_low + kd * dqj) / kp
+            + qj
+            - default_angles
+        )
+
+        abs_high = (
+            (torque_high + kd * dqj) / kp
+            + qj
+            - default_angles
+        )
+
+        # ----- 2. Desired-position rate bounds -----
+        max_daction = self.qd_rate_limits * self.config.control_dt
+
+        rate_low = self.prev_actions_scaled - max_daction
+        rate_high = self.prev_actions_scaled + max_daction
+
+        # ----- 3. PD torque-slew bounds -----
+        max_dtau = self.torque_slew_limits * self.config.control_dt
+
+        slew_tau_low = torch.maximum(
+            -self.torque_limits,
+            self.prev_pd_torque - max_dtau,
+        )
+
+        slew_tau_high = torch.minimum(
+            self.torque_limits,
+            self.prev_pd_torque + max_dtau,
+        )
+
+        slew_low = (
+            (slew_tau_low + kd * dqj) / kp
+            + qj
+            - default_angles
+        )
+
+        slew_high = (
+            (slew_tau_high + kd * dqj) / kp
+            + qj
+            - default_angles
+        )
+
+        # ----- Intersect all allowable intervals -----
+        actions_low = torch.maximum(
+            abs_low,
+            torch.maximum(rate_low, slew_low),
+        )
+
+        actions_high = torch.minimum(
+            abs_high,
+            torch.minimum(rate_high, slew_high),
+        )
+
+        actions_limited = torch.clamp(
+            actions_scaled,
+            min=actions_low,
+            max=actions_high,
+        )
+
+        # ----- Estimate torque actually commanded -----
+        q_des = default_angles + actions_limited
+
+        pd_torque = (
+            kp * (q_des - qj)
+            - kd * dqj
+        )
+
+        self.prev_actions_scaled = actions_limited.detach().clone()
+        self.prev_pd_torque = pd_torque.detach().clone()
+
+        return actions_limited
+
+    
     def calculate(self):
         # Get the current joint position and velocity
         for i in range(len(self.config.leg_joint2motor_idx)):
@@ -567,30 +675,57 @@ class DepthWaQController(TSController):
         obs_history_tensor = torch.from_numpy(self.obs_history).unsqueeze(0)
         visual_latent = self.visual_latent
 
+        # Get the action from the policy network
+        #policy_action = self.policy(
+        #    cur_obs_tensor,
+        #    obs_history_tensor,
+        #    visual_latent,
+        #).detach().squeeze(0)
         policy_action = self.policy(
             cur_obs_tensor, obs_history_tensor, visual_latent
         ).detach().numpy().squeeze()
+
         if not np.all(np.isfinite(policy_action)):
             if not self._reported_invalid_action:
                 print("Invalid depth-policy action; commanding the neutral pose.")
                 self._reported_invalid_action = True
-            self.action.fill(0.0)
-        else:
-            self.action = np.clip(
-                policy_action, -self.config.action_clip, self.config.action_clip
-            ).astype(np.float32)
-        
-        # transform action to target_dof_pos
-        target_dof_pos = self.config.default_angles + self.action * self.config.action_scale
+            policy_action = np.zeros(self.config.num_actions, dtype=np.float32)
+        #else:
+        #    self._reported_invalid_action = False
+        #    policy_action = np.clip(
+        #        policy_action, -self.config.action_clip, self.config.action_clip
+        #    ).astype(np.float32)
+
+        # limit_position_actions expects position offsets from default_angles.
+        # Convert normalized policy actions to offsets before limiting.
+        self.action = policy_action
+
+        action_offset = torch.from_numpy(
+            policy_action * self.config.action_scale
+        ).float()
+        #limited_action_offset = self.limit_position_actions(action_offset)
+        #limited_action_offset = limited_action_offset.detach().cpu().numpy()
+        limited_action_offset = action_offset.detach().cpu().numpy()
+
+        # Preserve normalized actions in the policy observation history.
+        # self.action = limited_action_offset
+        target_dof_pos = self.config.default_angles + limited_action_offset
 
         # Build low cmd
         for i in range(len(self.config.leg_joint2motor_idx)):
-            motor_idx = self.config.leg_joint2motor_idx[i]
+            #motor_idx = self.config.leg_joint2motor_idx[i]
             #self.low_cmd.motor_cmd[motor_idx].q = target_dof_pos[i]
-            self.low_cmd.motor_cmd[motor_idx].q = self.config.default_angles[i]
-            self.low_cmd.motor_cmd[motor_idx].dq = 0
+            ##self.low_cmd.motor_cmd[motor_idx].q = self.config.default_angles[i]
+            ##self.low_cmd.motor_cmd[motor_idx].dq = 0
+            #self.low_cmd.motor_cmd[motor_idx].dq = 0
             #self.low_cmd.motor_cmd[motor_idx].kp = self.config.ctrl_kp
-            self.low_cmd.motor_cmd[motor_idx].kp = self.config.stand_kp
+            ##self.low_cmd.motor_cmd[motor_idx].kp = self.config.stand_kp
             #self.low_cmd.motor_cmd[motor_idx].kd = self.config.ctrl_kd
-            self.low_cmd.motor_cmd[motor_idx].kd = self.config.stand_kd
+            ##self.low_cmd.motor_cmd[motor_idx].kd = self.config.stand_kd
+            #self.low_cmd.motor_cmd[motor_idx].tau = 0
+            motor_idx = self.config.leg_joint2motor_idx[i]
+            self.low_cmd.motor_cmd[motor_idx].q = target_dof_pos[i]
+            self.low_cmd.motor_cmd[motor_idx].dq = 0
+            self.low_cmd.motor_cmd[motor_idx].kp = self.config.ctrl_kp
+            self.low_cmd.motor_cmd[motor_idx].kd = self.config.ctrl_kd
             self.low_cmd.motor_cmd[motor_idx].tau = 0

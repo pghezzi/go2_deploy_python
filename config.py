@@ -20,6 +20,15 @@ class Config:
             self.depth_image_shape = config.get("depth_image_shape", [48, 64])
             self.num_loras = config.get("num_loras", 0)
             self.action_clip = config.get("action_clip", 10.0)
+            self.torque_limits = np.array(
+                config.get("torque_limits", [23.0, 23.0, 40.0] * 4),
+                dtype=np.float32,
+            )
+            self.qd_rate_limits = np.array(
+                config.get("qd_rate_limits", [8.0, 12.0, 16.0] * 4),
+                dtype=np.float32,
+            )
+            self.torque_slew_limits = float(config.get("torque_slew_limits", 500.0))
 
 
             self.leg_joint2motor_idx = config["leg_joint2motor_idx"]
