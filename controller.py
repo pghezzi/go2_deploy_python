@@ -4,6 +4,7 @@ import time
 import torch
 import threading
 from collections import deque
+from pathlib import Path
 
 from unitree_sdk2py.core.channel import ChannelPublisher
 from unitree_sdk2py.core.channel import ChannelSubscriber, ChannelFactoryInitialize
@@ -382,6 +383,20 @@ class DepthWaQController(TSController):
         self.prev_actions_scaled = torch.zeros(config.num_actions)
         self.prev_pd_torque = torch.zeros((12))
 
+        self._timing_lock = threading.Lock()
+        self._last_inference_time = None
+        self._last_cnn_time = None
+        self._last_timing_log_time = time.monotonic()
+        self._inference_interval_s = None
+        self._cnn_interval_s = None
+        self._timing_log_path = Path(config.timing_log_path)
+        self._timing_log_path.parent.mkdir(parents=True, exist_ok=True)
+        with self._timing_log_path.open("a", encoding="utf-8") as timing_log:
+            timing_log.write(
+                "# DepthWaQ timing session started "
+                f"{time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+            )
+
 
         # State Machine
         self.state = "zero_torque"  # initial state
@@ -443,20 +458,57 @@ class DepthWaQController(TSController):
         self.lowCmdThread.Start()
         
         self.mainControlThread = RecurrentThread(
-            interval=self.config.control_dt,
+            interval=1.0 / self.config.inference_rate_hz,
             target=self.mainControlStep,
             name="MainControlThread")
         self.mainControlThread.Start()
 
         if self.split:
             self.cnnThread = RecurrentThread(
-                        interval=self.config.control_dt * 5,
+                        interval=1.0 / self.config.cnn_rate_hz,
                         target=self.cnnHandler,
                         name="DepthCNNThread")
             self.cnnThread.Start()
 
     def cnnHandler(self):
         self.visual_latent = self.cnn(self.depth_image)
+        self._record_timing("cnn")
+
+    def _record_timing(self, task):
+        """Log observed policy/CNN completion intervals at a bounded rate."""
+        now = time.monotonic()
+        with self._timing_lock:
+            if task == "inference":
+                if self._last_inference_time is not None:
+                    self._inference_interval_s = now - self._last_inference_time
+                self._last_inference_time = now
+            elif task == "cnn":
+                if self._last_cnn_time is not None:
+                    self._cnn_interval_s = now - self._last_cnn_time
+                self._last_cnn_time = now
+            else:
+                raise ValueError(f"Unknown timing task: {task}")
+
+            if now - self._last_timing_log_time < self.config.timing_log_interval_s:
+                return
+
+            def format_interval(interval_s, target_hz):
+                if interval_s is None:
+                    return f"waiting (target {target_hz:.1f} Hz)"
+                return (
+                    f"{interval_s * 1000.0:.1f} ms "
+                    f"({1.0 / interval_s:.1f} Hz; target {target_hz:.1f} Hz)"
+                )
+
+            timing_line = (
+                f"{time.strftime('%Y-%m-%d %H:%M:%S')} [Timing] inference: "
+                f"{format_interval(self._inference_interval_s, self.config.inference_rate_hz)}; "
+                "CNN: "
+                f"{format_interval(self._cnn_interval_s, self.config.cnn_rate_hz)}"
+            )
+            with self._timing_log_path.open("a", encoding="utf-8") as timing_log:
+                timing_log.write(timing_line + "\n")
+            self._last_timing_log_time = now
     
     def DepthImageHandler(self, msg: DepthImage_):
         depth = np.asarray(msg.normalized_value, dtype=np.float32)
@@ -743,3 +795,5 @@ class DepthWaQController(TSController):
             #self.low_cmd.motor_cmd[motor_idx].kp = self.config.ctrl_kp
             #self.low_cmd.motor_cmd[motor_idx].kd = self.config.ctrl_kd
             #self.low_cmd.motor_cmd[motor_idx].tau = 0
+
+        self._record_timing("inference")

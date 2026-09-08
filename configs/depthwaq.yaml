@@ -1,6 +1,10 @@
 # 
 control_dt: 0.02        # 50Hz
 communication_dt: 0.002 # 500Hz
+inference_rate_hz: 50.0
+cnn_rate_hz: 10.0
+timing_log_interval_s: 1.0
+timing_log_path: "logs/depthwaq_timing.log"
 
 lowcmd_topic: "rt/lowcmd"
 lowstate_topic: "rt/lowstate"

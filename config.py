@@ -9,6 +9,27 @@ class Config:
 
             self.control_dt = config["control_dt"]
             self.communication_dt = config["communication_dt"]
+            self.inference_rate_hz = float(
+                config.get("inference_rate_hz", 1.0 / self.control_dt)
+            )
+            self.cnn_rate_hz = float(config.get("cnn_rate_hz", 10.0))
+            self.timing_log_interval_s = float(
+                config.get("timing_log_interval_s", 1.0)
+            )
+            self.timing_log_path = config.get(
+                "timing_log_path", "logs/depthwaq_timing.log"
+            )
+            if (
+                self.inference_rate_hz <= 0
+                or self.cnn_rate_hz <= 0
+                or self.timing_log_interval_s <= 0
+            ):
+                raise ValueError("Inference, CNN, and timing-log rates must be positive.")
+            if not np.isclose(self.control_dt, 1.0 / self.inference_rate_hz):
+                raise ValueError(
+                    "control_dt must equal 1 / inference_rate_hz so action limits "
+                    "use the actual policy timestep."
+                )
 
             self.lowcmd_topic = config["lowcmd_topic"]
             self.lowstate_topic = config["lowstate_topic"]
