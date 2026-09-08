@@ -733,13 +733,13 @@ class DepthWaQController(TSController):
 
         # Build low cmd
         for i, motor_idx in enumerate(self.config.leg_joint2motor_idx):
-            #self.low_cmd.motor_cmd[motor_idx].q = self.config.default_angles[i]
-            #self.low_cmd.motor_cmd[motor_idx].dq = 0
-            #self.low_cmd.motor_cmd[motor_idx].kp = self.config.stand_kp
-            #self.low_cmd.motor_cmd[motor_idx].kd = self.config.stand_kd
-
-            self.low_cmd.motor_cmd[motor_idx].q = target_dof_pos[i]
+            self.low_cmd.motor_cmd[motor_idx].q = self.config.default_angles[i]
             self.low_cmd.motor_cmd[motor_idx].dq = 0
-            self.low_cmd.motor_cmd[motor_idx].kp = self.config.ctrl_kp
-            self.low_cmd.motor_cmd[motor_idx].kd = self.config.ctrl_kd
-            self.low_cmd.motor_cmd[motor_idx].tau = 0
+            self.low_cmd.motor_cmd[motor_idx].kp = self.config.stand_kp
+            self.low_cmd.motor_cmd[motor_idx].kd = self.config.stand_kd
+            
+            #self.low_cmd.motor_cmd[motor_idx].q = target_dof_pos[i]
+            #self.low_cmd.motor_cmd[motor_idx].dq = 0
+            #self.low_cmd.motor_cmd[motor_idx].kp = self.config.ctrl_kp
+            #self.low_cmd.motor_cmd[motor_idx].kd = self.config.ctrl_kd
+            #self.low_cmd.motor_cmd[motor_idx].tau = 0
