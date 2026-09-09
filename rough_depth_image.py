@@ -1,10 +1,13 @@
 import time
 import numpy as np
-import cv2
+import torch
+import yaml
 import pyrealsense2 as rs
 
 from unitree_sdk2py.core.channel import ChannelPublisher, ChannelFactoryInitialize
 from common.depth_image_idl import DepthImage_
+from common.depth_processing import preprocess_depth_array
+from common.depth_image_saver import DepthImageSaver
 
 TOPIC_DEPTHIMAGE = "rt/depthimage"
 
@@ -23,6 +26,11 @@ class DepthImagePublisher:
         crop_bottom=0,
         crop_left=28,
         crop_right=36,
+        rotate_180=False,
+        interface=None,
+        save_processed_images=False,
+        image_save_probability=0.1,
+        image_save_dir="logs/depth_images",
     ):
         self.rs_width = width
         self.rs_height = height
@@ -37,6 +45,9 @@ class DepthImagePublisher:
         self.crop_bottom = crop_bottom
         self.crop_left = crop_left
         self.crop_right = crop_right
+        self.rotate_180 = rotate_180
+        self._last_stats_time = time.monotonic()
+        self._published_frames = 0
 
         # ============================================================
         # RealSense setup
@@ -127,7 +138,7 @@ class DepthImagePublisher:
         # DDS setup
         # ============================================================
 
-        ChannelFactoryInitialize(0)
+        ChannelFactoryInitialize(1 if interface == "lo" else 0, interface)
 
         self.publisher = ChannelPublisher(
             TOPIC_DEPTHIMAGE,
@@ -137,9 +148,18 @@ class DepthImagePublisher:
         self.publisher.Init()
 
         print()
+
+        self.image_saver = (
+            DepthImageSaver(image_save_dir, image_save_probability)
+            if save_processed_images else None
+        )
         print("DepthImagePublisher initialized")
         print("RealSense resolution:", self.rs_width, "x", self.rs_height)
         print("RealSense FPS:", self.rs_fps)
+        print("Rotate 180 degrees:", self.rotate_180)
+        print("DDS interface:", interface or "automatic")
+        print("Resize: adaptive average pooling (parkour reference)")
+        print("Crop endpoints: reference top:-bottom-1, left:-right-1")
         print(
             "Crop:",
             "top =", self.crop_top,
@@ -167,123 +187,17 @@ class DepthImagePublisher:
     # ================================================================
 
     def preprocess_depth(self, depth_frame):
-        """
-        Match VisualHandlerNode.get_depth_frame() preprocessing.
-
-        Input:
-            RealSense depth_frame
-
-        Output:
-            normalized depth image with shape (48, 64)
-            values in [0, 1]
-        """
-
-        # ------------------------------------------------------------
-        # Apply RealSense filters
-        # ------------------------------------------------------------
-
+        """Apply parkour's RealSense filters, then its tensor preprocessing."""
         for rs_filter in self.rs_filters:
             depth_frame = rs_filter.process(depth_frame)
-
-        # ------------------------------------------------------------
-        # Convert to numpy
-        # ------------------------------------------------------------
-
-        depth_image = np.asanyarray(
-            depth_frame.get_data()
+        return preprocess_depth_array(
+            np.asanyarray(depth_frame.get_data()),
+            depth_scale=self.depth_scale,
+            output_shape=(self.out_height, self.out_width),
+            depth_range_m=(self.depth_min / 1000.0, self.depth_max / 1000.0),
+            cropping=(self.crop_top, self.crop_bottom, self.crop_left, self.crop_right),
+            rotate_180=self.rotate_180,
         )
-        
-        # ------------------------------------------------------------
-        # Crop
-        #
-        # Same intended region as VisualHandlerNode
-        # ------------------------------------------------------------
-
-        h_end = depth_image.shape[0] - self.crop_bottom
-        w_end = depth_image.shape[1] - self.crop_right
-
-        depth_image = depth_image[
-            self.crop_top:h_end,
-            self.crop_left:w_end,
-        ]
-
-        # ------------------------------------------------------------
-        # Convert to float32
-        #
-        # RealSense z16 values are raw depth units.
-        # On your camera:
-        #
-        # depth_scale ~= 0.001 m
-        #
-        # therefore raw value ~= mm.
-        # ------------------------------------------------------------
-
-        depth_image = depth_image.astype(np.float32)
-
-        # Convert raw RealSense units to mm using actual scale.
-        #
-        # This makes the code robust if another RealSense has
-        # a different depth scale.
-        depth_image_mm = depth_image * (
-            self.depth_scale * 1000.0
-        )
-
-        # ------------------------------------------------------------
-        # Clip to depth range
-        # ------------------------------------------------------------
-
-        depth_image_mm = np.clip(
-            depth_image_mm,
-            self.depth_min,
-            self.depth_max,
-        )
-
-        # ------------------------------------------------------------
-        # Normalize to [0, 1]
-        #
-        # Same operation as VisualHandlerNode:
-        #
-        # torch.clip(...) / (max - min)
-        # ------------------------------------------------------------
-
-        depth_normalized = (
-            depth_image_mm - self.depth_min
-        ) / (
-            self.depth_max - self.depth_min
-        )
-
-        # ------------------------------------------------------------
-        # Resize to 48x64
-        #
-        # IMPORTANT:
-        #
-        # VisualHandlerNode uses:
-        #
-        # F.adaptive_avg_pool2d(...)
-        #
-        # INTER_AREA is close conceptually, but not exactly the
-        # same operation.
-        #
-        # For this standalone publisher, use INTER_AREA because
-        # it performs area averaging when shrinking.
-        # ------------------------------------------------------------
-
-        depth_small = cv2.resize(
-            depth_normalized,
-            (
-                self.out_width,
-                self.out_height,
-            ),
-            interpolation=cv2.INTER_AREA,
-        )
-
-        depth_small = np.clip(
-            depth_small,
-            0.0,
-            1.0,
-        ).astype(np.float32)
-
-        return depth_small
 
     # ================================================================
     # Publish
@@ -354,21 +268,22 @@ class DepthImagePublisher:
             normalized_value=flat,
         )
 
-        # Debug information
-        print(
-            "Publishing:",
-            "width =", msg.width,
-            "height =", msg.height,
-            "length =", len(msg.normalized_value),
-            "min =", min(msg.normalized_value),
-            "max =", max(msg.normalized_value),
-        )
-
-        # ------------------------------------------------------------
-        # Publish
-        # ------------------------------------------------------------
-
         self.publisher.Write(msg)
+        if self.image_saver is not None:
+            self.image_saver.sample(normalized)
+        self._published_frames += 1
+        now = time.monotonic()
+        elapsed = now - self._last_stats_time
+        if elapsed >= 1.0:
+            print(
+                f"Depth: {self._published_frames / elapsed:.1f} Hz, "
+                f"{self.out_width}x{self.out_height}, "
+                f"range=[{normalized.min():.3f}, {normalized.max():.3f}], "
+                f"zero_fraction={np.mean(normalized == 0):.3f}",
+                flush=True,
+            )
+            self._last_stats_time = now
+            self._published_frames = 0
 
     # ================================================================
     # Main loop
@@ -396,27 +311,51 @@ class DepthImagePublisher:
             print("\nStopping depth publisher...")
 
         finally:
-            self.pipeline.stop()
+            try:
+                self.pipeline.stop()
+            finally:
+                if self.image_saver is not None:
+                    self.image_saver.close()
+
+
+def main():
+    import argparse
+    from pathlib import Path
+
+    parser = argparse.ArgumentParser(description="Publish parkour-preprocessed RealSense depth over DDS.")
+    parser.add_argument("--interface", "-i", default=None, help="DDS interface, e.g. eth0")
+    parser.add_argument(
+        "--config", type=Path,
+        default=Path(__file__).resolve().parent / "configs" / "depthwaq.yaml",
+        help="Deployment YAML containing depth_camera settings",
+    )
+    args = parser.parse_args()
+    with args.config.open() as config_file:
+        config = yaml.safe_load(config_file)
+    camera = config.get("depth_camera", {})
+    height, width = camera.get("resolution", [480, 640])
+    top, bottom, left, right = camera.get("cropping", [48, 0, 28, 36])
+    near, far = camera.get("depth_range_m", [0.0, 3.0])
+    # This is a separate process from the controller; cap its Torch pool too.
+    torch.set_num_threads(config.get("torch_num_threads", 1))
+    torch.set_num_interop_threads(config.get("torch_num_interop_threads", 1))
+    publisher = DepthImagePublisher(
+        width=width,
+        height=height,
+        fps=camera.get("fps", 30),
+        depth_range=(near * 1000.0, far * 1000.0),
+        depth_image_shape=config.get("depth_image_shape", [48, 64]),
+        crop_top=top, crop_bottom=bottom, crop_left=left, crop_right=right,
+        rotate_180=camera.get("rotate_180", False),
+        interface=args.interface,
+        save_processed_images=camera.get("save_processed_images", False),
+        image_save_probability=camera.get("image_save_probability", 0.1),
+        image_save_dir=camera.get("image_save_dir", "logs/depth_images"),
+    )
+    # Like VisualHandlerNode, acquire/process on the embedding refresh period
+    # while the camera itself streams at its configured (normally 30 Hz) rate.
+    publisher.spin(rate_hz=config.get("cnn_rate_hz", 10.0))
 
 
 if __name__ == "__main__":
-    publisher = DepthImagePublisher(
-        width=640,
-        height=480,
-        fps=30,
-
-        # Same default as deployment:
-        # config [0.0, 3.0] meters -> [0, 3000] mm
-        depth_range=(0.0, 3000.0),
-
-        # Same network input resolution
-        depth_image_shape=(48, 64),
-
-        # Same deployment cropping
-        crop_top=48,
-        crop_bottom=0,
-        crop_left=28,
-        crop_right=36,
-    )
-
-    publisher.spin(rate_hz=30)
+    main()

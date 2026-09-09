@@ -48,7 +48,7 @@ trap 'exit 130' INT TERM
 cd "$script_dir"
 
 echo "Starting RealSense depth publisher (logging to $depth_log)..."
-"$python_bin" rough_depth_image.py >"$depth_log" 2>&1 &
+"$python_bin" -u rough_depth_image.py --interface "$interface" --config "configs/$config_name" >"$depth_log" 2>&1 &
 depth_pid=$!
 
 echo "Starting DepthWaQ controller on $interface with $config_name..."

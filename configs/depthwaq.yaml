@@ -18,6 +18,20 @@ policy_path: "./models/fft_jit_model/compiled_fft_20260903_225643.pt"
 cnn_path: "./models/fft_jit_model/compiled_fft_20260903_225643_split/DepthCNN.pt"
 actor_path: "./models/fft_jit_model/compiled_fft_20260903_225643_split/FeaturesWaQ.pt"
 depth_image_shape: [48, 64]
+# Parkour hardware preprocessing; camera dimensions are [height, width].
+# Training used 120x160, crops [12, 0, 7, 9], and depth in [0, 3] meters.
+# These crops are scaled by four for the 480x640 RealSense stream.
+# The reference also removes the final row/column, then uses adaptive average
+# pooling. Saved training code uses bicubic resizing instead.
+depth_camera:
+  resolution: [480, 640]
+  fps: 30
+  cropping: [48, 0, 28, 36] # top, bottom, left, right; before resizing
+  depth_range_m: [0.0, 3.0]
+  rotate_180: false # This camera is upright; the reference H1 mount is inverted.
+  save_processed_images: true # Random samples of the exact frames sent over DDS.
+  image_save_probability: 0.1 # 10% of frames: about one image/second at 10 Hz.
+  image_save_dir: "logs/depth_images" # A new session folder on each launch.
 num_loras: 3
 action_clip: 10.0
 # Unscaled commands: [forward m/s, lateral m/s, yaw rad/s]. Each key is the
@@ -33,10 +47,9 @@ torque_limits: [23.0, 23.0, 40.0, 23.0, 23.0, 40.0, 23.0, 23.0, 40.0, 23.0, 23.0
 qd_rate_limits: [8.0, 12.0, 16.0, 8.0, 12.0, 16.0, 8.0, 12.0, 16.0, 8.0, 12.0, 16.0]
 torque_slew_limits: 500.0
 
-# Unitree MuJoCo exposes motors/sensors in the trained Isaac Gym order:
-# FR, FL, RR, RL.  Hardware uses a different order and needs the old remap.
-#leg_joint2motor_idx: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
-leg_joint2motor_idx: [3, 4, 5, 0, 1, 2, 9, 10, 11, 6, 7, 8]
+# This depth checkpoint, Unitree MuJoCo, and the Go2 SDK all use FR, FL, RR, RL.
+leg_joint2motor_idx: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+# leg_joint2motor_idx: [3, 4, 5, 0, 1, 2, 9, 10, 11, 6, 7, 8]
 stand_kp: 60.0
 stand_kd: 5.0
 

@@ -3,6 +3,8 @@ import numpy as np
 import time
 import torch
 import threading
+import copy
+import platform
 from collections import deque
 from pathlib import Path
 
@@ -110,13 +112,23 @@ class TSController:
             self.low_cmd.motor_cmd[i].dq = VelStopF
             self.low_cmd.motor_cmd[i].kd = 0
             self.low_cmd.motor_cmd[i].tau = 0
+        self._prepare_command_for_publish()
+
+    def _prepare_command_for_publish(self):
+        # Only the control thread mutates low_cmd. Publish a separate, complete
+        # snapshot so CRC calculation and DDS serialization see identical data.
+        # Build at 50 Hz; the sender can keep transmitting the previous snapshot
+        # at 500 Hz while inference or the next command update is in progress.
+        command = copy.deepcopy(self.low_cmd)
+        command.crc = CRC().Crc(command)
+        self._command_to_publish = command
 
     def LowStateGoHandler(self, msg: LowStateGo):
         self.low_state = msg
         
     def LowCmdHandler(self):
-        self.low_cmd.crc = CRC().Crc(self.low_cmd)
-        self.lowcmd_publisher_.Write(self.low_cmd)
+        command = self._command_to_publish
+        self.lowcmd_publisher_.Write(command)
     
     def damping_state(self):
         create_damping_cmd(self.low_cmd)
@@ -209,20 +221,20 @@ class TSController:
         self.remote_controller.set(self.low_state.wireless_remote)
         # Update State Machine
         self.updateStateMachine()
-        locker.acquire()
-        if self.state == "zero_torque":
-            self.zero_torque_state()
-        elif self.state == "damping":
-            self.damping_state()
-        elif self.state == "sit":
-            self.move_to_sit_pos()
-        elif self.state == "stand":
-            self.move_to_stand_pos()
-        elif self.state == "ctrl":
-            self.calculate()
-        else:
-            raise ValueError("Invalid state.")
-        locker.release()
+        with locker:
+            if self.state == "zero_torque":
+                self.zero_torque_state()
+            elif self.state == "damping":
+                self.damping_state()
+            elif self.state == "sit":
+                self.move_to_sit_pos()
+            elif self.state == "stand":
+                self.move_to_stand_pos()
+            elif self.state == "ctrl":
+                self.calculate()
+            else:
+                raise ValueError("Invalid state.")
+            self._prepare_command_for_publish()
         
         self.control_step_count += 1
         
@@ -365,12 +377,12 @@ class DepthWaQController(TSController):
         if self.split:
             print("Loading cnn network from:", config.cnn_path)
             print("Loading actor network from:", config.actor_path)
-            self.depth_cnn = torch.jit.load(config.cnn_path)
+            self.depth_cnn = torch.jit.load(config.cnn_path, map_location="cpu").eval()
             self.cnn = lambda depth_image: self.depth_cnn(depth_image.unsqueeze(0))
-            self.policy = torch.jit.load(config.actor_path)
+            self.policy = torch.jit.load(config.actor_path, map_location="cpu").eval()
         else:
             print("Loading policy network from:", config.policy_path)
-            self.policy = torch.jit.load(config.policy_path)
+            self.policy = torch.jit.load(config.policy_path, map_location="cpu").eval()
         # Initializing process variables
         self.qj = np.zeros(config.num_actions, dtype=np.float32)
         self.dqj = np.zeros(config.num_actions, dtype=np.float32)
@@ -402,12 +414,24 @@ class DepthWaQController(TSController):
         self._inference_duration_s = None
         self._actor_forward_duration_s = None
         self._cnn_duration_s = None
+        self._lowstate_sample = (None, None)
+        self._last_publish_time = None
+        self._max_publish_interval_s = 0.0
+        self._received_states = 0
+        self._received_depth_frames = 0
+        self._control_diagnostics = {}
+        self._limiter_conflicts = 0
         self._timing_log_path = Path(config.timing_log_path)
         self._timing_log_path.parent.mkdir(parents=True, exist_ok=True)
         with self._timing_log_path.open("a", encoding="utf-8") as timing_log:
             timing_log.write(
                 "# DepthWaQ timing session started "
                 f"{time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+            )
+            timing_log.write(
+                f"# interface={interface} host={platform.node()} arch={platform.machine()} "
+                f"policy={config.actor_path if config.split else config.policy_path} "
+                f"joint_mapping={config.leg_joint2motor_idx}\n"
             )
 
 
@@ -433,13 +457,16 @@ class DepthWaQController(TSController):
         self.lowstate_subscriber.Init(self.LowStateGoHandler, 10)
 
         self.depth_image = torch.zeros((1, *config.depth_image_shape))
+        self._depth_sample = (self.depth_image, None)
         self.depth_width = config.depth_image_shape[1]
         self.depth_height = config.depth_image_shape[0]
 
         if self.split:
-            self.visual_latent = self.cnn(self.depth_image)
+            with torch.inference_mode():
+                self.visual_latent = self.cnn(self.depth_image)
         else:
             self.visual_latent = self.depth_image.unsqueeze(0)
+        self._visual_sample = (self.visual_latent, None)
         self.active_lora_index = -1
 
         self.depth_subscriber = ChannelSubscriber(TOPIC_DEPTHIMAGE, DepthImage_)
@@ -483,9 +510,29 @@ class DepthWaQController(TSController):
                         name="DepthCNNThread")
             self.cnnThread.Start()
 
+    def LowStateGoHandler(self, msg: LowStateGo):
+        received_at = time.monotonic()
+        self._lowstate_sample = (msg, received_at)
+        self.low_state = msg
+        with self._timing_lock:
+            self._received_states += 1
+
+    def LowCmdHandler(self):
+        super().LowCmdHandler()
+        now = time.monotonic()
+        with self._timing_lock:
+            if self._last_publish_time is not None:
+                self._max_publish_interval_s = max(
+                    self._max_publish_interval_s, now - self._last_publish_time
+                )
+            self._last_publish_time = now
+
+    @torch.inference_mode()
     def cnnHandler(self):
         start = time.perf_counter()
-        self.visual_latent = self.cnn(self.depth_image)
+        depth_image, received_at = self._depth_sample
+        self.visual_latent = self.cnn(depth_image)
+        self._visual_sample = (self.visual_latent, received_at)
         self._record_timing("cnn", time.perf_counter() - start)
 
     def _record_timing(self, task, duration_s, forward_duration_s=None):
@@ -521,6 +568,12 @@ class DepthWaQController(TSController):
             def format_duration(duration_s):
                 return "waiting" if duration_s is None else f"{duration_s * 1000.0:.2f} ms"
 
+            def format_age(received_at):
+                return "missing" if received_at is None else f"{max(0.0, now - received_at) * 1000.0:.1f} ms"
+
+            elapsed = now - self._last_timing_log_time
+            depth_image, depth_received_at = self._depth_sample
+            depth_array = depth_image.numpy()
             timing_line = (
                 f"{time.strftime('%Y-%m-%d %H:%M:%S')} [Timing] "
                 "actor completion interval: "
@@ -529,9 +582,22 @@ class DepthWaQController(TSController):
                 f"actor forward: {format_duration(self._actor_forward_duration_s)}; "
                 "CNN completion interval: "
                 f"{format_interval(self._cnn_interval_s, self.config.cnn_rate_hz)}; "
-                f"CNN forward: {format_duration(self._cnn_duration_s)}"
+                f"CNN forward: {format_duration(self._cnn_duration_s)}; "
+                f"state={self.state} policy_index={self.active_lora_index}; "
+                f"lowstate: {self._received_states / elapsed:.1f} Hz "
+                f"age={format_age(self._lowstate_sample[1])}; "
+                f"depth: {self._received_depth_frames / elapsed:.1f} Hz "
+                f"age={format_age(depth_received_at)} "
+                f"range=[{depth_array.min():.3f},{depth_array.max():.3f}] "
+                f"zero_fraction={np.mean(depth_array == 0):.3f}; "
+                f"visual source age={format_age(self._visual_sample[1])}; "
+                f"lowcmd max publish gap={self._max_publish_interval_s * 1000.0:.2f} ms; "
+                f"control={self._control_diagnostics}"
             )
             self._last_timing_log_time = now
+            self._received_states = 0
+            self._received_depth_frames = 0
+            self._max_publish_interval_s = 0.0
 
         # Disk I/O must not block the actor or CNN thread while it holds the
         # shared timing lock.
@@ -552,13 +618,22 @@ class DepthWaQController(TSController):
             )
             return
 
+        if not np.all(np.isfinite(depth)) or np.any((depth < 0) | (depth > 1)):
+            print("Ignoring depth image outside the finite normalized [0, 1] range.")
+            return
+
         # Shape: [1, H, W]
         self.depth_image = torch.from_numpy(
-            depth.reshape(expected_height, expected_width)
+            depth.reshape(expected_height, expected_width).copy()
         ).unsqueeze(0)
+        received_at = time.monotonic()
+        self._depth_sample = (self.depth_image, received_at)
+        with self._timing_lock:
+            self._received_depth_frames += 1
 
         if not self.split:
             self.visual_latent = self.depth_image.unsqueeze(0)
+            self._visual_sample = (self.visual_latent, received_at)
         
         if HAS_DISPLAY:
             # -----------------------------
@@ -577,7 +652,10 @@ class DepthWaQController(TSController):
         self.policy.swap(index)
         self.active_lora_index = index
         if self.split:
-            self.visual_latent = self.cnn(self.depth_image)
+            depth_image, received_at = self._depth_sample
+            with torch.inference_mode():
+                self.visual_latent = self.cnn(depth_image)
+            self._visual_sample = (self.visual_latent, received_at)
         print(f"Switched depth policy to {index}")
 
     def updateStateMachine(self):
@@ -663,14 +741,17 @@ class DepthWaQController(TSController):
         # ----- 3. PD torque-slew bounds -----
         max_dtau = self.torque_slew_limits * self.config.control_dt
 
+        previous_torque = torch.clamp(
+            self.prev_pd_torque, -self.torque_limits, self.torque_limits
+        )
         slew_tau_low = torch.maximum(
             -self.torque_limits,
-            self.prev_pd_torque - max_dtau,
+            previous_torque - max_dtau,
         )
 
         slew_tau_high = torch.minimum(
             self.torque_limits,
-            self.prev_pd_torque + max_dtau,
+            previous_torque + max_dtau,
         )
 
         slew_low = (
@@ -696,6 +777,15 @@ class DepthWaQController(TSController):
             torch.minimum(rate_high, slew_high),
         )
 
+        # A moving joint can make the position-rate and torque intervals
+        # disjoint. torch.clamp(min > max) silently returns max, which can
+        # violate the torque bound. In that case prioritize the torque/slew
+        # interval and report that the position-rate bound could not be met.
+        conflicts = actions_low > actions_high
+        self._limiter_conflicts = int(conflicts.sum().item())
+        actions_low = torch.where(conflicts, slew_low, actions_low)
+        actions_high = torch.where(conflicts, slew_high, actions_high)
+
         actions_limited = torch.clamp(
             actions_scaled,
             min=actions_low,
@@ -716,17 +806,21 @@ class DepthWaQController(TSController):
         return actions_limited
 
     
+    @torch.inference_mode()
     def calculate(self):
         step_start = time.perf_counter()
+        low_state, state_received_at = self._lowstate_sample
+        if low_state is None:
+            raise RuntimeError("No low-state sample received for depth-policy inference.")
         # Get the current joint position and velocity
         for i in range(len(self.config.leg_joint2motor_idx)):
-            self.qj[i] = self.low_state.motor_state[self.config.leg_joint2motor_idx[i]].q
-            self.dqj[i] = self.low_state.motor_state[self.config.leg_joint2motor_idx[i]].dq
+            self.qj[i] = low_state.motor_state[self.config.leg_joint2motor_idx[i]].q
+            self.dqj[i] = low_state.motor_state[self.config.leg_joint2motor_idx[i]].dq
 
         # imu_state quaternion: w, x, y, z
-        quat = self.low_state.imu_state.quaternion
-        ang_vel = np.asarray(self.low_state.imu_state.gyroscope, dtype=np.float32)
-        self.euler = self.low_state.imu_state.rpy
+        quat = low_state.imu_state.quaternion
+        ang_vel = np.asarray(low_state.imu_state.gyroscope, dtype=np.float32)
+        self.euler = low_state.imu_state.rpy
 
         # create observation
         gravity_orientation = get_gravity_orientation(quat)
@@ -777,7 +871,7 @@ class DepthWaQController(TSController):
         # Get the action from the policy network
         cur_obs_tensor = torch.from_numpy(self.cur_obs).unsqueeze(0)
         obs_history_tensor = torch.from_numpy(self.obs_history).unsqueeze(0)
-        visual_latent = self.visual_latent
+        visual_latent, visual_received_at = self._visual_sample
 
         # Get the action from the policy network
         #policy_action = self.policy(
@@ -796,11 +890,11 @@ class DepthWaQController(TSController):
                 print("Invalid depth-policy action; commanding the neutral pose.")
                 self._reported_invalid_action = True
             policy_action = np.zeros(self.config.num_actions, dtype=np.float32)
-        #else:
-        #    self._reported_invalid_action = False
-        #    policy_action = np.clip(
-        #        policy_action, -self.config.action_clip, self.config.action_clip
-        #    ).astype(np.float32)
+        else:
+            self._reported_invalid_action = False
+            policy_action = np.clip(
+                policy_action, -self.config.action_clip, self.config.action_clip
+            ).astype(np.float32)
 
         # limit_position_actions expects position offsets from default_angles.
         # Convert normalized policy actions to offsets before limiting.
@@ -810,10 +904,25 @@ class DepthWaQController(TSController):
         limited_action_offset = self.limit_position_actions(action_offset)
         limited_action_offset = limited_action_offset.detach().cpu().numpy()
 
-        # The observation must contain the action actually sent to the motors,
-        # expressed in the policy's normalized action units.
+        # Training stores the clipped policy request before simulator torque
+        # limits and delay. Keep that convention; log how much the additional
+        # deployment limiter changes the requested position below.
         self.action = policy_action
         target_dof_pos = self.config.default_angles + limited_action_offset
+        limiter_delta = np.abs(limited_action_offset - policy_action * self.config.action_scale)
+        now = time.monotonic()
+        self._control_diagnostics = {
+            "state_age_at_inference_ms": round((now - state_received_at) * 1000, 2),
+            "visual_source_age_ms": None if visual_received_at is None else round((now - visual_received_at) * 1000, 2),
+            "quat_norm": round(float(np.linalg.norm(quat)), 4),
+            "gravity": np.round(gravity_orientation, 3).tolist(),
+            "max_abs_dq": round(float(np.max(np.abs(self.dqj))), 3),
+            "max_abs_action": round(float(np.max(np.abs(policy_action))), 3),
+            "limited_joints": int(np.count_nonzero(limiter_delta > 1e-5)),
+            "max_limiter_delta_rad": round(float(limiter_delta.max()), 4),
+            "limiter_conflicts": self._limiter_conflicts,
+            "max_tracking_error_rad": round(float(np.max(np.abs(target_dof_pos - self.qj))), 4),
+        }
 
         # Build low cmd
         for i, motor_idx in enumerate(self.config.leg_joint2motor_idx):
