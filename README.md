@@ -71,6 +71,12 @@ This project is an modification of [original python deployment code provided by 
 ./deploy_depthwaq.sh eth0
 ```
 
+The launcher sets `OPENBLAS_NUM_THREADS=1` and `OMP_NUM_THREADS=1` before
+starting Python, alongside the controller's configured PyTorch thread limits.
+The robot's NumPy and system OpenBLAS libraries otherwise keep separate
+four-thread pools even when PyTorch reports one thread. If launching the Python
+programs directly, set these environment variables before starting them too.
+
 The launcher passes the same DDS interface and deployment YAML to the camera
 publisher and controller. Camera settings live in `configs/depthwaq.yaml` under
 `depth_camera`; `depth_image_shape` controls the network input size.

@@ -14,9 +14,9 @@ lowcmd_topic: "rt/lowcmd"
 lowstate_topic: "rt/lowstate"
 
 split: True
-policy_path: "./models/fft_jit_model/compiled_fft_20260903_225643.pt"
-cnn_path: "./models/fft_jit_model/compiled_fft_20260903_225643_split/DepthCNN.pt"
-actor_path: "./models/fft_jit_model/compiled_fft_20260903_225643_split/FeaturesWaQ.pt"
+policy_path: "./models/fft_jit_model_01/compiled_distilled_20260909_183242.pt"
+cnn_path: "./models/fft_jit_model_01/compiled_distilled_20260909_183242_split/DepthCNN.pt"
+actor_path: "./models/fft_jit_model_01/compiled_distilled_20260909_183242_split/FeaturesWaQ.pt"
 depth_image_shape: [48, 64]
 # Parkour hardware preprocessing; camera dimensions are [height, width].
 # Training used 120x160, crops [12, 0, 7, 9], and depth in [0, 3] meters.
@@ -39,7 +39,7 @@ action_clip: 10.0
 # All current policies were trained with this non-baseline profile after its
 # forward-speed curriculum reached 1.5 m/s.
 command_ranges:
-  "-1": {lower: [-1.0, -1.0, -1.0], upper: [1.5, 1.0, 1.0]}
+  "-1": {lower: [-1.0, -1.0, -1.0], upper: [1.0, 1.0, 1.0]}
   "0": {lower: [0.0, 0.0, -1.0], upper: [1.5, 0.0, 1.0]} # gap
   "1": {lower: [0.0, 0.0, -1.0], upper: [1.5, 0.0, 1.0]} # all_stairs
   "2": {lower: [0.0, 0.0, -1.0], upper: [1.5, 0.0, 1.0]} # pit

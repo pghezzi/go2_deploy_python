@@ -15,6 +15,11 @@ config_name="${2:-depthwaq.yaml}"
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 python_bin="${PYTHON_BIN:-python3}"
 
+# Apply before either Python process imports NumPy or PyTorch. The robot's
+# OpenBLAS pools retain four workers even after torch.set_num_threads(1).
+export OPENBLAS_NUM_THREADS=1
+export OMP_NUM_THREADS=1
+
 if [[ "$interface" == "lo" ]]; then
     echo "Refusing to deploy to loopback. Provide the robot Ethernet interface." >&2
     exit 2
