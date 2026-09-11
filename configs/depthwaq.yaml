@@ -18,6 +18,18 @@ policy_path: "./models/fft_jit_model_01/compiled_distilled_20260909_183242.pt"
 cnn_path: "./models/fft_jit_model_01/compiled_distilled_20260909_183242_split/DepthCNN.pt"
 actor_path: "./models/fft_jit_model_01/compiled_distilled_20260909_183242_split/FeaturesWaQ.pt"
 depth_image_shape: [48, 64]
+# Optional terrain-driven LoRA routing. Export a model from Legged_Gym_EX with
+# `python -m legged_gym.scripts.export_depth_terrain_classifier ...`, then set
+# enabled/model_path. Supported modes are instantaneous, ema, and bayes.
+terrain_selector:
+  enabled: false
+  model_path: "./models/demo_classifier/terrain_selector_feature_nn_best_seed_0.pt"
+  mode: "bayes"
+  ema_alpha: 0.6
+  change_patience: 1
+  stable_stay: 0.9
+  # Override only if your classifier used nonstandard label names.
+  label_to_lora: {}
 # Parkour hardware preprocessing; camera dimensions are [height, width].
 # Training used 120x160, crops [12, 0, 7, 9], and depth in [0, 3] meters.
 # These crops are scaled by four for the 480x640 RealSense stream.

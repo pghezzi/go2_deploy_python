@@ -71,6 +71,40 @@ This project is an modification of [original python deployment code provided by 
 ./deploy_depthwaq.sh eth0
 ```
 
+### Terrain-classifier routing
+
+DepthWaQ can route its existing base/gap/stairs/pit LoRA policies automatically
+from any trained paper classifier: raw-depth or engineered-feature, with
+instantaneous, EMA, or Bayes temporal selection. First export a self-contained
+TorchScript bundle from Legged_Gym_EX (example: paper raw-depth seed 0):
+
+```bash
+python -m legged_gym.scripts.export_depth_terrain_classifier \
+  --architecture raw_depth_nn \
+  --checkpoint paper_offline_eval/artifacts/raw_depth_nn/seed_0/classifier.pt \
+  --model-args paper_offline_eval/artifacts/raw_depth_nn/seed_0/nn_model_args.pt \
+  --output /path/to/go2_deploy_python/models/terrain_selector_raw_depth.pt \
+  --selector-mode bayes
+```
+
+For `feature_nn`, add `--extractor paper_offline_eval/artifacts/feature_nn/extractor.pt`
+and `--standardizer paper_offline_eval/artifacts/feature_nn/standardizer.pt`.
+Enable `terrain_selector` in `configs/depthwaq.yaml`, set `model_path`, and select
+`instantaneous`, `ema`, or `bayes`. Standard class names map to the existing LoRA
+slots: rough → base (-1), gap → 0, stairs → 1, pit → 2. `label_to_lora` can
+override that mapping for a custom dataset.
+
+To export the automatically selected best held-out seed for both raw-depth and
+feature classifiers in one command, run this from Legged_Gym_EX:
+
+```bash
+python -m legged_gym.scripts.export_best_paper_terrain_classifiers \
+  --output-dir /path/to/go2_deploy_python/models
+```
+
+It writes two models and `best_terrain_selectors.json`, which includes the
+ready-to-copy configuration for each instantaneous/EMA/Bayes variant.
+
 The launcher sets `OPENBLAS_NUM_THREADS=1` and `OMP_NUM_THREADS=1` before
 starting Python, alongside the controller's configured PyTorch thread limits.
 The robot's NumPy and system OpenBLAS libraries otherwise keep separate

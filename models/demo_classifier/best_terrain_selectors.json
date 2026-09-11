@@ -1,0 +1,114 @@
+{
+  "selection": "highest_balanced_accuracy_then_lower_nll_then_lower_brier_then_seed",
+  "source": "/home/pablo/Documents/Legged_Gym_EX/paper_offline_eval",
+  "class_ordering": [
+    "pit",
+    "stairs",
+    "gap",
+    "random_uniform"
+  ],
+  "models": {
+    "feature_nn": {
+      "seed": 0,
+      "selection_metrics": {
+        "balanced_accuracy": 0.9492437876272892,
+        "nll": 0.13191135227680206,
+        "brier": 0.06486930698156357
+      },
+      "model_path": "/home/pablo/Documents/go2_deploy_python/models/demo_classifier/terrain_selector_feature_nn_best_seed_0.pt",
+      "model_manifest": {
+        "format": "depthwaq-terrain-selector-v1",
+        "architecture": "feature_nn",
+        "class_ids": [
+          "pit",
+          "stairs",
+          "gap",
+          "random_uniform"
+        ],
+        "input_shape": [
+          48,
+          64
+        ],
+        "selector_mode": "instantaneous",
+        "ema": {
+          "ema_alpha": 0.6,
+          "change_patience": 1
+        },
+        "bayes": {
+          "stable_stay": 0.9
+        }
+      },
+      "deployment_modes": [
+        {
+          "enabled": true,
+          "model_path": "/home/pablo/Documents/go2_deploy_python/models/demo_classifier/terrain_selector_feature_nn_best_seed_0.pt",
+          "mode": "instantaneous"
+        },
+        {
+          "enabled": true,
+          "model_path": "/home/pablo/Documents/go2_deploy_python/models/demo_classifier/terrain_selector_feature_nn_best_seed_0.pt",
+          "mode": "ema",
+          "change_patience": 1,
+          "ema_alpha": 0.6
+        },
+        {
+          "enabled": true,
+          "model_path": "/home/pablo/Documents/go2_deploy_python/models/demo_classifier/terrain_selector_feature_nn_best_seed_0.pt",
+          "mode": "bayes",
+          "stable_stay": 0.9
+        }
+      ]
+    },
+    "raw_depth_nn": {
+      "seed": 0,
+      "selection_metrics": {
+        "balanced_accuracy": 0.9267738517901067,
+        "nll": 0.1832474321126938,
+        "brier": 0.09239355474710464
+      },
+      "model_path": "/home/pablo/Documents/go2_deploy_python/models/demo_classifier/terrain_selector_raw_depth_nn_best_seed_0.pt",
+      "model_manifest": {
+        "format": "depthwaq-terrain-selector-v1",
+        "architecture": "raw_depth_nn",
+        "class_ids": [
+          "pit",
+          "stairs",
+          "gap",
+          "random_uniform"
+        ],
+        "input_shape": [
+          48,
+          64
+        ],
+        "selector_mode": "instantaneous",
+        "ema": {
+          "ema_alpha": 0.6,
+          "change_patience": 1
+        },
+        "bayes": {
+          "stable_stay": 0.9
+        }
+      },
+      "deployment_modes": [
+        {
+          "enabled": true,
+          "model_path": "/home/pablo/Documents/go2_deploy_python/models/demo_classifier/terrain_selector_raw_depth_nn_best_seed_0.pt",
+          "mode": "instantaneous"
+        },
+        {
+          "enabled": true,
+          "model_path": "/home/pablo/Documents/go2_deploy_python/models/demo_classifier/terrain_selector_raw_depth_nn_best_seed_0.pt",
+          "mode": "ema",
+          "change_patience": 1,
+          "ema_alpha": 0.6
+        },
+        {
+          "enabled": true,
+          "model_path": "/home/pablo/Documents/go2_deploy_python/models/demo_classifier/terrain_selector_raw_depth_nn_best_seed_0.pt",
+          "mode": "bayes",
+          "stable_stay": 0.9
+        }
+      ]
+    }
+  }
+}

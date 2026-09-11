@@ -48,6 +48,25 @@ class Config:
             self.cnn_path = config.get("cnn_path", None)
             self.actor_path = config.get("actor_path", None)
             self.depth_image_shape = config.get("depth_image_shape", [48, 64])
+            selector = config.get("terrain_selector", {})
+            self.terrain_selector_enabled = bool(selector.get("enabled", False))
+            self.terrain_selector_model_path = selector.get("model_path")
+            self.terrain_selector_mode = selector.get("mode", "instantaneous")
+            self.terrain_selector_ema_alpha = float(selector.get("ema_alpha", 0.6))
+            self.terrain_selector_change_patience = int(selector.get("change_patience", 1))
+            self.terrain_selector_stable_stay = float(selector.get("stable_stay", 0.9))
+            self.terrain_selector_label_to_lora = selector.get("label_to_lora", {})
+            if self.terrain_selector_enabled:
+                if not self.terrain_selector_model_path:
+                    raise ValueError("terrain_selector.model_path is required when enabled")
+                if self.terrain_selector_mode not in ("instantaneous", "ema", "bayes"):
+                    raise ValueError("terrain_selector.mode must be instantaneous, ema, or bayes")
+                if not 0 < self.terrain_selector_ema_alpha <= 1:
+                    raise ValueError("terrain_selector.ema_alpha must be in (0, 1]")
+                if self.terrain_selector_change_patience < 1:
+                    raise ValueError("terrain_selector.change_patience must be >= 1")
+                if not 0 < self.terrain_selector_stable_stay <= 1:
+                    raise ValueError("terrain_selector.stable_stay must be in (0, 1]")
             self.num_loras = config.get("num_loras", 0)
             self.action_clip = config.get("action_clip", 10.0)
             command_ranges = config.get("command_ranges", {})

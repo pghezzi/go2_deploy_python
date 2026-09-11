@@ -1,0 +1,22 @@
+{
+  "format": "depthwaq-terrain-selector-v1",
+  "architecture": "raw_depth_nn",
+  "class_ids": [
+    "pit",
+    "stairs",
+    "gap",
+    "random_uniform"
+  ],
+  "input_shape": [
+    48,
+    64
+  ],
+  "selector_mode": "instantaneous",
+  "ema": {
+    "ema_alpha": 0.6,
+    "change_patience": 1
+  },
+  "bayes": {
+    "stable_stay": 0.9
+  }
+}

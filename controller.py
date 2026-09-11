@@ -22,6 +22,7 @@ from common.command_helper import create_damping_cmd, create_zero_cmd
 from common.rotation_helper import get_gravity_orientation
 from common.remote_controller import RemoteController, KeyMap
 from config import Config
+from terrain_selector import TerrainSelector
 
 locker = threading.Lock()
 
@@ -374,6 +375,7 @@ class DepthWaQController(TSController):
 
         # Initialize the policy network
         self.split = config.split
+        self._model_lock = threading.Lock()
         if self.split:
             print("Loading cnn network from:", config.cnn_path)
             print("Loading actor network from:", config.actor_path)
@@ -420,6 +422,8 @@ class DepthWaQController(TSController):
         self._received_states = 0
         self._received_depth_frames = 0
         self._control_diagnostics = {}
+        self._terrain_selection = {"label": "disabled", "lora_index": -1,
+                                   "confidence": None, "instantaneous_label": "disabled"}
         self._limiter_conflicts = 0
         self._timing_log_path = Path(config.timing_log_path)
         self._timing_log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -468,6 +472,23 @@ class DepthWaQController(TSController):
             self.visual_latent = self.depth_image.unsqueeze(0)
         self._visual_sample = (self.visual_latent, None)
         self.active_lora_index = -1
+        self.terrain_selector = None
+        if config.terrain_selector_enabled:
+            self.terrain_selector = TerrainSelector(
+                config.terrain_selector_model_path,
+                mode=config.terrain_selector_mode,
+                label_to_lora=config.terrain_selector_label_to_lora,
+                ema_alpha=config.terrain_selector_ema_alpha,
+                change_patience=config.terrain_selector_change_patience,
+                stable_stay=config.terrain_selector_stable_stay,
+            )
+            if tuple(config.depth_image_shape) != self.terrain_selector.input_shape:
+                raise ValueError(
+                    "DepthWaQ depth_image_shape does not match terrain selector input: "
+                    f"{config.depth_image_shape} != {list(self.terrain_selector.input_shape)}"
+                )
+            print("Terrain selector enabled:", config.terrain_selector_mode,
+                  "from", config.terrain_selector_model_path)
 
         self.depth_subscriber = ChannelSubscriber(TOPIC_DEPTHIMAGE, DepthImage_)
         self.depth_subscriber.Init(self.DepthImageHandler, 1)
@@ -509,6 +530,12 @@ class DepthWaQController(TSController):
                         target=self.cnnHandler,
                         name="DepthCNNThread")
             self.cnnThread.Start()
+        elif self.terrain_selector is not None:
+            self.selectorThread = RecurrentThread(
+                        interval=1.0 / self.config.cnn_rate_hz,
+                        target=self.selectorHandler,
+                        name="TerrainSelectorThread")
+            self.selectorThread.Start()
 
     def LowStateGoHandler(self, msg: LowStateGo):
         received_at = time.monotonic()
@@ -531,9 +558,34 @@ class DepthWaQController(TSController):
     def cnnHandler(self):
         start = time.perf_counter()
         depth_image, received_at = self._depth_sample
-        self.visual_latent = self.cnn(depth_image)
+        with self._model_lock:
+            self.visual_latent = self.cnn(depth_image)
         self._visual_sample = (self.visual_latent, received_at)
+        self._update_terrain_selector(depth_image, received_at)
         self._record_timing("cnn", time.perf_counter() - start)
+
+    @torch.inference_mode()
+    def selectorHandler(self):
+        depth_image, received_at = self._depth_sample
+        self._update_terrain_selector(depth_image, received_at)
+
+    def _update_terrain_selector(self, depth_image, received_at):
+        if self.terrain_selector is None:
+            return
+        low_state, _ = self._lowstate_sample
+        if received_at is None or low_state is None:
+            return
+        try:
+            selection = self.terrain_selector.update(
+                depth_image.squeeze(0), low_state.imu_state.rpy,
+                low_state.imu_state.gyroscope,
+            )
+            self._terrain_selection = selection
+            if selection["lora_index"] != self.active_lora_index:
+                self.swap_policy(selection["lora_index"], source="terrain selector")
+        except Exception as error:
+            # A bad camera frame must never interrupt the locomotion loop.
+            print(f"Terrain selector update ignored: {error}")
 
     def _record_timing(self, task, duration_s, forward_duration_s=None):
         """Log model execution time and completion intervals at a bounded rate."""
@@ -583,7 +635,8 @@ class DepthWaQController(TSController):
                 "CNN completion interval: "
                 f"{format_interval(self._cnn_interval_s, self.config.cnn_rate_hz)}; "
                 f"CNN forward: {format_duration(self._cnn_duration_s)}; "
-                f"state={self.state} policy_index={self.active_lora_index}; "
+                f"state={self.state} policy_index={self.active_lora_index} "
+                f"terrain={self._terrain_selection}; "
                 f"lowstate: {self._received_states / elapsed:.1f} Hz "
                 f"age={format_age(self._lowstate_sample[1])}; "
                 f"depth: {self._received_depth_frames / elapsed:.1f} Hz "
@@ -646,17 +699,21 @@ class DepthWaQController(TSController):
 
         #print("Depth Received")
 
-    def swap_policy(self, index):
-        if self.split:
-            self.depth_cnn.swap(index)
-        self.policy.swap(index)
+    def swap_policy(self, index, source="remote"):
+        if index < -1 or index >= self.config.num_loras:
+            raise ValueError(f"Invalid LoRA index {index}")
+        with self._model_lock:
+            if self.split:
+                self.depth_cnn.swap(index)
+            self.policy.swap(index)
         self.active_lora_index = index
         if self.split:
             depth_image, received_at = self._depth_sample
             with torch.inference_mode():
-                self.visual_latent = self.cnn(depth_image)
+                with self._model_lock:
+                    self.visual_latent = self.cnn(depth_image)
             self._visual_sample = (self.visual_latent, received_at)
-        print(f"Switched depth policy to {index}")
+        print(f"Switched depth policy to {index} ({source})")
 
     def updateStateMachine(self):
             if self.remote_controller.button[KeyMap.L1].pressed and self.remote_controller.button[KeyMap.left].on_press:
@@ -880,9 +937,10 @@ class DepthWaQController(TSController):
         #    visual_latent,
         #).detach().squeeze(0)
         policy_start = time.perf_counter()
-        policy_action = self.policy(
-            cur_obs_tensor, obs_history_tensor, visual_latent
-        ).detach().numpy().squeeze()
+        with self._model_lock:
+            policy_action = self.policy(
+                cur_obs_tensor, obs_history_tensor, visual_latent
+            ).detach().numpy().squeeze()
         actor_forward_duration = time.perf_counter() - policy_start
 
         if not np.all(np.isfinite(policy_action)):
@@ -922,6 +980,8 @@ class DepthWaQController(TSController):
             "max_limiter_delta_rad": round(float(limiter_delta.max()), 4),
             "limiter_conflicts": self._limiter_conflicts,
             "max_tracking_error_rad": round(float(np.max(np.abs(target_dof_pos - self.qj))), 4),
+            "terrain_label": self._terrain_selection["label"],
+            "terrain_confidence": self._terrain_selection["confidence"],
         }
 
         # Build low cmd
