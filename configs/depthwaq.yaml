@@ -14,15 +14,15 @@ lowcmd_topic: "rt/lowcmd"
 lowstate_topic: "rt/lowstate"
 
 split: True
-policy_path: "./models/fft_jit_model_01/compiled_distilled_20260909_183242.pt"
-cnn_path: "./models/fft_jit_model_01/compiled_distilled_20260909_183242_split/DepthCNN.pt"
-actor_path: "./models/fft_jit_model_01/compiled_distilled_20260909_183242_split/FeaturesWaQ.pt"
+policy_path: "./models/demo_swap_model/compiled_fft_20260903_225643.pt"
+cnn_path: "./models/demo_swap_model/compiled_fft_20260903_225643_split/DepthCNN.pt"
+actor_path: "./modles/demo_swap_model/compiled_fft_20260903_225643_split/FeaturesWaQ.pt"
 depth_image_shape: [48, 64]
 # Optional terrain-driven LoRA routing. Export a model from Legged_Gym_EX with
 # `python -m legged_gym.scripts.export_depth_terrain_classifier ...`, then set
 # enabled/model_path. Supported modes are instantaneous, ema, and bayes.
 terrain_selector:
-  enabled: false
+  enabled: true
   model_path: "./models/demo_classifier/terrain_selector_feature_nn_best_seed_0.pt"
   mode: "bayes"
   ema_alpha: 0.6
