@@ -90,9 +90,10 @@ python -m legged_gym.scripts.export_depth_terrain_classifier \
 For `feature_nn`, add `--extractor paper_offline_eval/artifacts/feature_nn/extractor.pt`
 and `--standardizer paper_offline_eval/artifacts/feature_nn/standardizer.pt`.
 Enable `terrain_selector` in `configs/depthwaq.yaml`, set `model_path`, and select
-`instantaneous`, `ema`, or `bayes`. Standard class names map to the existing LoRA
-slots: rough → base (-1), gap → 0, stairs → 1, pit → 2. `label_to_lora` can
-override that mapping for a custom dataset.
+`instantaneous`, `ema`, or `bayes`. The `terrain_selector.label_to_lora` mapping
+in that YAML file assigns classifier labels to LoRA slots: rough → base (-1),
+gap → 0, stairs → 1, pit → 2. Edit it for your labels and policies; every class
+in the exported classifier must have a configured mapping.
 
 To export the automatically selected best held-out seed for both raw-depth and
 feature classifiers in one command, run this from Legged_Gym_EX:

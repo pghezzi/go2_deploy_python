@@ -13,16 +13,16 @@ from pathlib import Path
 import torch
 
 
-DEFAULT_LABEL_TO_LORA = {
-    "rough": -1, "random_uniform": -1, "pyramid_sloped": -1, "plane": -1,
-    "gap": 0, "leap": 0,
-    "stairs": 1, "upwards_stairs": 1, "all_stairs": 1,
-    "pit": 2, "center_platform": 2, "climb": 2,
-}
+BAYES_EPS = 1e-8
+
+
+def _normalize_bayes_matrix(matrix):
+    matrix = matrix.clamp_min(BAYES_EPS)
+    return matrix / matrix.sum(dim=1, keepdim=True).clamp_min(BAYES_EPS)
 
 
 class TerrainSelector:
-    def __init__(self, model_path, *, mode="instantaneous", label_to_lora=None,
+    def __init__(self, model_path, *, label_to_lora, mode="instantaneous",
                  ema_alpha=0.6, change_patience=1, stable_stay=0.9):
         self.model_path = Path(model_path)
         if not self.model_path.is_file():
@@ -43,8 +43,7 @@ class TerrainSelector:
         self.stable_stay = float(stable_stay)
         if not 0 < self.ema_alpha <= 1 or self.change_patience < 1 or not 0 < self.stable_stay <= 1:
             raise ValueError("invalid terrain selector filter configuration")
-        mapping = dict(DEFAULT_LABEL_TO_LORA)
-        mapping.update({str(key).lower(): int(value) for key, value in (label_to_lora or {}).items()})
+        mapping = {str(key).lower(): int(value) for key, value in label_to_lora.items()}
         missing = [label for label in self.class_ids if label.lower() not in mapping]
         if missing:
             raise ValueError(f"No LoRA mapping configured for classifier labels: {missing}")
@@ -58,9 +57,14 @@ class TerrainSelector:
         self.pending_index = None
         self.pending_count = 0
         count = len(self.class_ids)
-        self.belief = torch.full((count,), 1.0 / count)
+        self.belief = torch.full((count,), 1.0 / count).clamp_min(BAYES_EPS)
+        self.belief /= self.belief.sum().clamp_min(BAYES_EPS)
         self.transition = torch.full((count, count), (1.0 - self.stable_stay) / max(count - 1, 1))
         self.transition.fill_diagonal_(self.stable_stay)
+        # The paper normalizes at transition construction and filter initialization.
+        self.transition = _normalize_bayes_matrix(self.transition)
+        self.transition = _normalize_bayes_matrix(self.transition)
+        self.observation = _normalize_bayes_matrix(torch.eye(count))
 
     def _ema(self, logits):
         if self.ema_logits is None:
@@ -80,10 +84,13 @@ class TerrainSelector:
         return self.selected_index
 
     def _bayes(self, logits):
-        probabilities = torch.softmax(logits, dim=0)
+        probabilities = torch.softmax(logits, dim=0).to(torch.float32).clamp_min(BAYES_EPS)
+        probabilities /= probabilities.sum().clamp_min(BAYES_EPS)
         predicted = self.belief @ self.transition
-        self.belief = predicted * probabilities
-        self.belief /= self.belief.sum().clamp_min(1e-8)
+        predicted /= predicted.sum().clamp_min(BAYES_EPS)
+        likelihood = (self.observation @ probabilities).clamp_min(BAYES_EPS)
+        self.belief = predicted * likelihood
+        self.belief /= self.belief.sum().clamp_min(BAYES_EPS)
         return int(self.belief.argmax())
 
     @torch.inference_mode()
