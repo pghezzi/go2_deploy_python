@@ -72,8 +72,18 @@ This project is an modification of [original python deployment code provided by 
 to -1 (rough/base), 0 (gap), 1 (stairs), or 2 (pit), then run:
 
 ```bash
-python deploy.py --type single_policy --interface lo
+# MuJoCo (start the simulator separately):
+./deploy_single_policy.sh lo
+
+# Robot (replace eth0 with its network interface):
+./deploy_single_policy.sh eth0
 ```
+
+The hardware command starts the RealSense depth publisher and controller using
+`configs/single_policy.yaml`; exiting the launcher stops both processes. Camera
+output goes to `/tmp/single_policy_depth_publisher.log`. For another config use
+`./deploy_single_policy.sh eth0 other_config.yaml`. Set `PYTHON_BIN` to select a
+Python executable if needed.
 
 Override the YAML selection for one run with `--policy-index 2` or choose another
 combined model with `--model /path/to/model.pt`. A bundle's policy slot is selected
