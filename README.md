@@ -95,6 +95,20 @@ depth frame. Timing is written to `logs/single_policy_timing.log`. Set
 `timing_log_enabled: false` in either controller YAML to disable timing logging
 (including log file creation); it defaults to `true` when omitted.
 
+State controls (hold L1 and press the second button):
+
+| Button | Transition |
+| --- | --- |
+| R1 | Damping → sit, or stand → sit |
+| R2 | Sit → stand, or control → stand |
+| A | Stand → control |
+| Y | Any state → damping (highest priority) |
+| X | Damping → zero torque |
+
+These controls also apply to the other deployment controllers. Sit and stand
+transitions interpolate from the measured joint positions. Unavailable
+transitions are ignored.
+
 ## DepthWaQ hardware deployment and diagnostics
 
 ```bash

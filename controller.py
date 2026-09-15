@@ -171,48 +171,33 @@ class TSController:
         self.transition2stand_step += 1
     
     def updateStateMachine(self):
-        if self.remote_controller.button[KeyMap.L1].pressed and self.remote_controller.button[KeyMap.R1].on_press:
-            if self.state == "damping": # damping to sit
-                print("Moving to sit pos.")
-                # record the current pos
-                dof_idx = self.config.leg_joint2motor_idx
-                for i in range(self.config.num_actions):
-                    self.transition2sit_init_dof_pos[i] = self.low_state.motor_state[dof_idx[i]].q
-                # reset step counter
-                self.transition2sit_step = 0
-                self.state = "sit"
-            else:
-                raise NotImplementedError("Cannot transition from damping to states other than sit.")
-        elif self.remote_controller.button[KeyMap.L1].pressed and self.remote_controller.button[KeyMap.R2].on_press:
-            if self.state == "sit": # sit to stand
-                print("Moving to stand pos.")
-                # record the current pos
-                dof_idx = self.config.leg_joint2motor_idx
-                for i in range(self.config.num_actions):
-                    self.transition2stand_init_dof_pos[i] = self.low_state.motor_state[dof_idx[i]].q
-                # reset step counter
-                self.transition2stand_step = 0
-                self.state = "stand"
-            else:
-                raise NotImplementedError("Cannot transition from sit to states other than stand.")
-        elif self.remote_controller.button[KeyMap.L1].pressed and self.remote_controller.button[KeyMap.A].on_press:
-            if self.state == "stand": # stand to ctrl
-                print("Entering control state.")
-                self.state = "ctrl"
-            else:
-                raise NotImplementedError("Cannot transition from stand to states other than ctrl.")
-        elif self.remote_controller.button[KeyMap.L1].pressed and self.remote_controller.button[KeyMap.Y].on_press:
+        buttons = self.remote_controller.button
+        if not buttons[KeyMap.L1].pressed:
+            return
+
+        # Damping takes priority over every other simultaneous command.
+        if buttons[KeyMap.Y].on_press:
             print("Enter damping state.")
             self.state = "damping"
-            # back to damping from any state
-        elif self.remote_controller.button[KeyMap.L1].pressed and self.remote_controller.button[KeyMap.X].on_press:
-            if self.state == "damping":
-                print("Enter zero torque state.")
-                self.state = "zero_torque"
-            else:
-                raise NotImplementedError("Can only enter zero torque state from damping state.")
-        else:
-            pass
+        elif buttons[KeyMap.R1].on_press and self.state in ("damping", "stand"):
+            print("Moving to sit pos.")
+            for i, motor_idx in enumerate(self.config.leg_joint2motor_idx):
+                self.transition2sit_init_dof_pos[i] = self.low_state.motor_state[motor_idx].q
+            self.transition2sit_step = 0
+            self.state = "sit"
+        elif buttons[KeyMap.R2].on_press and self.state in ("sit", "ctrl"):
+            print("Moving to stand pos.")
+            for i, motor_idx in enumerate(self.config.leg_joint2motor_idx):
+                self.transition2stand_init_dof_pos[i] = self.low_state.motor_state[motor_idx].q
+            self.transition2stand_step = 0
+            self.state = "stand"
+        elif buttons[KeyMap.A].on_press and self.state == "stand":
+            print("Entering control state.")
+            self.state = "ctrl"
+        elif buttons[KeyMap.X].on_press and self.state == "damping":
+            print("Enter zero torque state.")
+            self.state = "zero_torque"
+        # Ignore unavailable transitions so a stray press cannot stop the loop.
 
     def mainControlStep(self):
         if self.control_step_count == 50:
@@ -723,53 +708,15 @@ class DepthWaQController(TSController):
         print(f"Switched depth policy to {index} ({source})")
 
     def updateStateMachine(self):
-            if self.remote_controller.button[KeyMap.L1].pressed and self.remote_controller.button[KeyMap.left].on_press:
+        buttons = self.remote_controller.button
+        if buttons[KeyMap.L1].pressed and not buttons[KeyMap.Y].on_press:
+            if buttons[KeyMap.left].on_press:
                 self.swap_policy(-1)
-            elif self.remote_controller.button[KeyMap.L1].pressed and self.remote_controller.button[KeyMap.right].on_press:
+                return
+            if buttons[KeyMap.right].on_press:
                 self.swap_policy((self.active_lora_index + 1) % self.config.num_loras)
-            elif self.remote_controller.button[KeyMap.L1].pressed and self.remote_controller.button[KeyMap.R1].on_press:
-                if self.state == "damping": # damping to sit
-                    print("Moving to sit pos.")
-                    # record the current pos
-                    dof_idx = self.config.leg_joint2motor_idx
-                    for i in range(self.config.num_actions):
-                        self.transition2sit_init_dof_pos[i] = self.low_state.motor_state[dof_idx[i]].q
-                    # reset step counter
-                    self.transition2sit_step = 0
-                    self.state = "sit"
-                else:
-                    raise NotImplementedError("Cannot transition from damping to states other than sit.")
-            elif self.remote_controller.button[KeyMap.L1].pressed and self.remote_controller.button[KeyMap.R2].on_press:
-                if self.state == "sit": # sit to stand
-                    print("Moving to stand pos.")
-                    # record the current pos
-                    dof_idx = self.config.leg_joint2motor_idx
-                    for i in range(self.config.num_actions):
-                        self.transition2stand_init_dof_pos[i] = self.low_state.motor_state[dof_idx[i]].q
-                    # reset step counter
-                    self.transition2stand_step = 0
-                    self.state = "stand"
-                    print("here")
-                else:
-                    raise NotImplementedError("Cannot transition from sit to states other than stand.")
-            elif self.remote_controller.button[KeyMap.L1].pressed and self.remote_controller.button[KeyMap.A].on_press:
-                if self.state == "stand": # stand to ctrl
-                    print("Entering control state.")
-                    self.state = "ctrl"
-                else:
-                    raise NotImplementedError("Cannot transition from stand to states other than ctrl.")
-            elif self.remote_controller.button[KeyMap.L1].pressed and self.remote_controller.button[KeyMap.Y].on_press:
-                print("Enter damping state.")
-                self.state = "damping"
-                # back to damping from any state
-            elif self.remote_controller.button[KeyMap.L1].pressed and self.remote_controller.button[KeyMap.X].on_press:
-                if self.state == "damping":
-                    print("Enter zero torque state.")
-                    self.state = "zero_torque"
-                else:
-                    raise NotImplementedError("Can only enter zero torque state from damping state.")
-            else:
-                pass
+                return
+        super().updateStateMachine()
 
     def limit_position_actions(self, actions_scaled):
         qj = torch.from_numpy(self.qj).float()
