@@ -31,7 +31,12 @@ class DepthImagePublisher:
         save_processed_images=False,
         image_save_probability=0.1,
         image_save_dir="logs/depth_images",
+        shadow_socket=None,
     ):
+        self.shadow_tap = None
+        if shadow_socket:
+            from shadow_experiment.camera_tap import CameraTap
+            self.shadow_tap = CameraTap(shadow_socket)
         self.rs_width = width
         self.rs_height = height
         self.rs_fps = fps
@@ -65,6 +70,14 @@ class DepthImagePublisher:
         )
 
         self.profile = self.pipeline.start(self.config)
+        if self.shadow_tap is not None:
+            device = self.profile.get_device()
+            self.shadow_tap.identity = {
+                "serial": device.get_info(rs.camera_info.serial_number),
+                "firmware": device.get_info(rs.camera_info.firmware_version),
+                "name": device.get_info(rs.camera_info.name),
+                "intrinsics": str(self.profile.get_stream(rs.stream.depth).as_video_stream_profile().get_intrinsics()),
+            }
 
         # Get actual depth scale
         self.depth_sensor = (
@@ -205,12 +218,20 @@ class DepthImagePublisher:
 
     def publish_frame(self):
         frames = self.pipeline.wait_for_frames()
+        receipt_ns = time.monotonic_ns()
 
         depth_frame = frames.get_depth_frame()
 
         if not depth_frame:
             print("No depth frame")
             return
+
+        if self.shadow_tap is not None:
+            try:
+                self.shadow_tap.offer(depth_frame, self.depth_scale, receipt_ns)
+            except Exception as error:
+                self.shadow_tap.record_drop()
+                print(f"Shadow camera tap ignored an error: {error}", flush=True)
 
         # Preprocess exactly like the deployment pipeline
         normalized = self.preprocess_depth(
@@ -316,6 +337,8 @@ class DepthImagePublisher:
             finally:
                 if self.image_saver is not None:
                     self.image_saver.close()
+                if self.shadow_tap is not None:
+                    self.shadow_tap.close()
 
 
 def main():
@@ -329,6 +352,7 @@ def main():
         default=Path(__file__).resolve().parent / "configs" / "depthwaq.yaml",
         help="Deployment YAML containing depth_camera settings",
     )
+    parser.add_argument("--shadow-socket", help="Optional local raw-frame tap for a separate shadow collector")
     args = parser.parse_args()
     with args.config.open() as config_file:
         config = yaml.safe_load(config_file)
@@ -351,6 +375,7 @@ def main():
         save_processed_images=camera.get("save_processed_images", False),
         image_save_probability=camera.get("image_save_probability", 0.1),
         image_save_dir=camera.get("image_save_dir", "logs/depth_images"),
+        shadow_socket=args.shadow_socket,
     )
     # Like VisualHandlerNode, acquire/process on the embedding refresh period
     # while the camera itself streams at its configured (normally 30 Hz) rate.

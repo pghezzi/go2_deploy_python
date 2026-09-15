@@ -83,8 +83,10 @@ class TerrainSelector:
             self.selected_index, self.pending_index, self.pending_count = candidate, None, 0
         return self.selected_index
 
-    def _bayes(self, logits):
-        probabilities = torch.softmax(logits, dim=0).to(torch.float32).clamp_min(BAYES_EPS)
+    def _bayes(self, logits, probabilities=None):
+        if probabilities is None:
+            probabilities = torch.softmax(logits, dim=0)
+        probabilities = probabilities.to(torch.float32).clamp_min(BAYES_EPS)
         probabilities /= probabilities.sum().clamp_min(BAYES_EPS)
         predicted = self.belief @ self.transition
         predicted /= predicted.sum().clamp_min(BAYES_EPS)

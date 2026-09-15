@@ -218,3 +218,11 @@ integration checks are skipped if the local exported depth models are absent.
 |  Teacher-Student  |  ![](https://raw.githubusercontent.com/lupinjia/demo_imgs/refs/heads/master/ts_demo.gif)   |   [genesis_lr/go2_ts](https://github.com/lupinjia/genesis_lr/tree/main/legged_gym/envs/go2/go2_ts)  |
 | Explicit Estimator | ![](https://raw.githubusercontent.com/lupinjia/demo_imgs/refs/heads/master/ee_demo.gif) | [genesis_lr/go2_ee](https://github.com/lupinjia/genesis_lr/tree/main/legged_gym/envs/go2/go2_ee) |
 | DreamWaQ | ![](https://raw.githubusercontent.com/lupinjia/demo_imgs/refs/heads/master/dreamwaq_demo.gif) | [genesis_lr/go2_dreamwaq](https://github.com/lupinjia/genesis_lr/tree/main/legged_gym/envs/go2/go2_dreamwaq) |
+
+## Shadow-mode terrain-selection experiment
+
+See [the experiment guide](shadow_experiment/README.md) for independent hardware
+collection, trial configuration, replay, paper reports, and isolated timing
+benchmarks. The collector subscribes to robot state and records all six selector
+proposals without publishing motor commands or switching policies. Example
+configurations are in `configs/shadow/` and use `models/classifiers_latest_offline`.

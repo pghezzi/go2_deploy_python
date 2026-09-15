@@ -6,3 +6,8 @@ __pycache__
 **.pt
 **.json
 **.log
+# Keep the inspected reference provenance with the experiment code.
+!shadow_experiment/reference_snapshot.json
+/shadow_trials/
+/shadow_report/
+/isolated_benchmark/

@@ -1,0 +1,54 @@
+experiment: go2_shadow
+configuration: gap_easy
+terrain_description: "Example only: straight approach to one measured gap; replace dimensions with the actual setup."
+difficulty: easy
+obstacle_dimensions_m: {gap_width: 0.20, gap_depth: 0.30, landing_height: 0.0}
+robot_identity: "REPLACE_WITH_ROBOT_SERIAL"
+trial_id: '003'
+initial_class: rough
+target_class: gap
+transition:
+  type: operator
+  marker: transition
+  gamepad: {enabled: true, modifier: null, button: B}
+# Alternatives (exactly one condition):
+# transition: {type: time, seconds: 5.0}
+# transition: {type: position, axis: x, comparison: ge, threshold_m: 2.0}
+# Position is reported sport-state odometry; annotation does not verify crossing.
+reference_repo: /home/oscaryoungquist/Legged_Gym_EX
+output_root: shadow_trials
+models:
+  feature:
+    path: models/classifiers_latest_offline/terrain_selector_feature_nn_best_seed_0.pt
+    seed: 0
+  raw:
+    path: models/classifiers_latest_offline/terrain_selector_raw_depth_nn_best_seed_1.pt
+    seed: 1
+class_mapping: {random_uniform: rough, gap: gap, stairs: stairs, pit: climb}
+filters: {ema_alpha: 0.6, change_patience: 1, stable_stay: 0.9}
+camera:
+  source: realsense # or publisher_tap, with optional --shadow-socket on rough_depth_image.py
+  socket_path: /tmp/go2_shadow_camera.sock
+  resolution: [480, 640]
+  fps: 30
+  preprocessing: training_bicubic
+  cropping: [48, 0, 28, 36]
+  depth_range_m: [0.0, 3.0]
+  rotate_180: false
+  realsense_filters: false
+  rgb: false # direct capture only; saves synchronized frameset RGB, unregistered
+  max_rgb_skew_ms: 20
+runtime:
+  device: cpu
+  seed: 0
+  torch_threads: 1
+  update_hz: 10
+  queue_size: 2
+  state_buffer_size: 256
+  chunk_frames: 8
+  max_state_age_s: 0.050
+  max_input_age_s: 0.250
+  duration_s: 30
+analysis:
+  max_contiguous_gap_s: 0.35
+  excluded_intervals_s: [] # [start,end) from trial start; uncertain annotations, occlusion, etc.
