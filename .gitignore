@@ -2,3 +2,7 @@ __pycache__
 
 # Logs, source snapshots, and depth images downloaded from robots.
 /logs/robot_*/
+**logs/*
+**.pt
+**.json
+**.log

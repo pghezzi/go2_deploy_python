@@ -61,12 +61,21 @@ else
 fi
 
 echo "Starting single-policy controller on $interface with $config_name..."
-"$python_bin" deploy.py --interface "$interface" --config "$config_name" --type single_policy "$@" &
+"$python_bin" -u deploy.py --interface "$interface" --config "$config_name" --type single_policy "$@" &
 controller_pid=$!
 
 # Stop the companion process if either the controller or camera exits.
 if [[ -n "$depth_pid" ]]; then
-    wait -n "$controller_pid" "$depth_pid"
+    exit_status=0
+    wait -n "$controller_pid" "$depth_pid" || exit_status=$?
+    if ! kill -0 "$depth_pid" 2>/dev/null; then
+        echo "Depth publisher exited; stopping the controller. Camera log: $depth_log" >&2
+        tail -n 80 "$depth_log" >&2 || true
+    else
+        echo "Controller exited; stopping the depth publisher." >&2
+    fi
+    echo "Child process exit status: $exit_status" >&2
+    exit "$exit_status"
 else
     wait "$controller_pid"
 fi
