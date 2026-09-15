@@ -376,15 +376,8 @@ class DepthWaQController(TSController):
         # Initialize the policy network
         self.split = config.split
         self._model_lock = threading.Lock()
-        if self.split:
-            print("Loading cnn network from:", config.cnn_path)
-            print("Loading actor network from:", config.actor_path)
-            self.depth_cnn = torch.jit.load(config.cnn_path, map_location="cpu").eval()
-            self.cnn = lambda depth_image: self.depth_cnn(depth_image.unsqueeze(0))
-            self.policy = torch.jit.load(config.actor_path, map_location="cpu").eval()
-        else:
-            print("Loading policy network from:", config.policy_path)
-            self.policy = torch.jit.load(config.policy_path, map_location="cpu").eval()
+        self.active_lora_index = -1
+        self._load_policy_models()
         # Initializing process variables
         self.qj = np.zeros(config.num_actions, dtype=np.float32)
         self.dqj = np.zeros(config.num_actions, dtype=np.float32)
@@ -426,17 +419,18 @@ class DepthWaQController(TSController):
                                    "confidence": None, "instantaneous_label": "disabled"}
         self._limiter_conflicts = 0
         self._timing_log_path = Path(config.timing_log_path)
-        self._timing_log_path.parent.mkdir(parents=True, exist_ok=True)
-        with self._timing_log_path.open("a", encoding="utf-8") as timing_log:
-            timing_log.write(
-                "# DepthWaQ timing session started "
-                f"{time.strftime('%Y-%m-%d %H:%M:%S')}\n"
-            )
-            timing_log.write(
-                f"# interface={interface} host={platform.node()} arch={platform.machine()} "
-                f"policy={config.actor_path if config.split else config.policy_path} "
-                f"joint_mapping={config.leg_joint2motor_idx}\n"
-            )
+        if config.timing_log_enabled:
+            self._timing_log_path.parent.mkdir(parents=True, exist_ok=True)
+            with self._timing_log_path.open("a", encoding="utf-8") as timing_log:
+                timing_log.write(
+                    "# DepthWaQ timing session started "
+                    f"{time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                )
+                timing_log.write(
+                    f"# interface={interface} host={platform.node()} arch={platform.machine()} "
+                    f"policy={config.actor_path if config.split else config.policy_path} "
+                    f"joint_mapping={config.leg_joint2motor_idx}\n"
+                )
 
 
         # State Machine
@@ -471,7 +465,6 @@ class DepthWaQController(TSController):
         else:
             self.visual_latent = self.depth_image.unsqueeze(0)
         self._visual_sample = (self.visual_latent, None)
-        self.active_lora_index = -1
         self.terrain_selector = None
         if config.terrain_selector_enabled:
             self.terrain_selector = TerrainSelector(
@@ -537,6 +530,18 @@ class DepthWaQController(TSController):
                         name="TerrainSelectorThread")
             self.selectorThread.Start()
 
+    def _load_policy_models(self):
+        """Load policy modules before subscribers and control threads start."""
+        if self.split:
+            print("Loading cnn network from:", self.config.cnn_path)
+            print("Loading actor network from:", self.config.actor_path)
+            self.depth_cnn = torch.jit.load(self.config.cnn_path, map_location="cpu").eval()
+            self.cnn = lambda depth_image: self.depth_cnn(depth_image.unsqueeze(0))
+            self.policy = torch.jit.load(self.config.actor_path, map_location="cpu").eval()
+        else:
+            print("Loading policy network from:", self.config.policy_path)
+            self.policy = torch.jit.load(self.config.policy_path, map_location="cpu").eval()
+
     def LowStateGoHandler(self, msg: LowStateGo):
         received_at = time.monotonic()
         self._lowstate_sample = (msg, received_at)
@@ -589,6 +594,8 @@ class DepthWaQController(TSController):
 
     def _record_timing(self, task, duration_s, forward_duration_s=None):
         """Log model execution time and completion intervals at a bounded rate."""
+        if not self.config.timing_log_enabled:
+            return
         now = time.monotonic()
         timing_line = None
         with self._timing_lock:
@@ -865,6 +872,7 @@ class DepthWaQController(TSController):
     
     @torch.inference_mode()
     def calculate(self):
+        print(f"Terrain:{self._terrain_selection}")
         step_start = time.perf_counter()
         low_state, state_received_at = self._lowstate_sample
         if low_state is None:

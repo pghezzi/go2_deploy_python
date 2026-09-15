@@ -13,6 +13,9 @@ class Config:
                 config.get("inference_rate_hz", 1.0 / self.control_dt)
             )
             self.cnn_rate_hz = float(config.get("cnn_rate_hz", 10.0))
+            self.timing_log_enabled = config.get("timing_log_enabled", True)
+            if not isinstance(self.timing_log_enabled, bool):
+                raise ValueError("timing_log_enabled must be a boolean")
             self.timing_log_interval_s = float(
                 config.get("timing_log_interval_s", 1.0)
             )
@@ -43,6 +46,7 @@ class Config:
             self.lowcmd_topic = config["lowcmd_topic"]
             self.lowstate_topic = config["lowstate_topic"]
             self.policy_path = config["policy_path"]
+            self.fixed_policy_index = config.get("fixed_policy_index", -1)
 
             self.split = config.get("split", False)
             self.cnn_path = config.get("cnn_path", None)

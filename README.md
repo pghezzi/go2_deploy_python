@@ -65,6 +65,26 @@ This project is an modification of [original python deployment code provided by 
   python deploy.py --config=ee.yaml --type=ee
   ```
 
+## Single-policy debugging
+
+`SinglePolicyController` uses its own `configs/single_policy.yaml`. Set
+`policy_path` to a combined DepthWaQ TorchScript model and `fixed_policy_index`
+to -1 (rough/base), 0 (gap), 1 (stairs), or 2 (pit), then run:
+
+```bash
+python deploy.py --type single_policy --interface lo
+```
+
+Override the YAML selection for one run with `--policy-index 2` or choose another
+combined model with `--model /path/to/model.pt`. A bundle's policy slot is selected
+once before control threads start. A model without `swap()` runs directly, with
+the index selecting its command bounds. Terrain routing and manual policy-swap
+buttons are disabled; sit, stand, control, damping, and zero-torque controls work
+as usual. The combined model, including its CNN, runs at 50 Hz using the latest
+depth frame. Timing is written to `logs/single_policy_timing.log`. Set
+`timing_log_enabled: false` in either controller YAML to disable timing logging
+(including log file creation); it defaults to `true` when omitted.
+
 ## DepthWaQ hardware deployment and diagnostics
 
 ```bash

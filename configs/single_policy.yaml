@@ -1,0 +1,61 @@
+# Standalone DepthWaQ locomotion debugging. One combined model, fixed at startup.
+# Run: python deploy.py --type single_policy --interface lo
+policy_path: "./models/deploy_multi_model/policy.pt"
+fixed_policy_index: 2 # -1 rough/base, 0 gap, 1 stairs, 2 pit
+num_loras: 3
+split: false
+terrain_selector:
+  enabled: false
+
+control_dt: 0.02
+communication_dt: 0.002
+inference_rate_hz: 50.0
+# The combined model evaluates its depth CNN on each 50 Hz policy step.
+cnn_rate_hz: 10.0
+torch_num_threads: 1
+torch_num_interop_threads: 1
+timing_log_enabled: true # Set false to disable timing file creation and writes.
+timing_log_interval_s: 1.0
+timing_log_path: "logs/single_policy_timing.log"
+
+lowcmd_topic: "rt/lowcmd"
+lowstate_topic: "rt/lowstate"
+depth_image_shape: [48, 64]
+# For a separately launched hardware depth publisher; MuJoCo publishes directly.
+depth_camera:
+  resolution: [480, 640]
+  fps: 30
+  cropping: [48, 0, 28, 36]
+  depth_range_m: [0.0, 3.0]
+  rotate_180: false
+  save_processed_images: true
+  image_save_probability: 0.1
+  image_save_dir: "logs/single_policy_depth_images"
+
+command_ranges:
+  "-1": {lower: [-1.0, -1.0, -1.0], upper: [1.0, 1.0, 1.0]}
+  "0": {lower: [0.0, 0.0, -1.0], upper: [1.5, 0.0, 1.0]}
+  "1": {lower: [0.0, 0.0, -1.0], upper: [1.5, 0.0, 1.0]}
+  "2": {lower: [0.0, 0.0, -1.0], upper: [1.0, 0.0, 1.0]}
+max_cmd: [1.0, 1.0, 1.0]
+cmd_scale: [1.0, 1.0, 0.25]
+
+action_clip: 10.0
+torque_limits: [23.0, 23.0, 40.0, 23.0, 23.0, 40.0, 23.0, 23.0, 40.0, 23.0, 23.0, 40.0]
+qd_rate_limits: [8.0, 12.0, 16.0, 8.0, 12.0, 16.0, 8.0, 12.0, 16.0, 8.0, 12.0, 16.0]
+torque_slew_limits: 500.0
+
+leg_joint2motor_idx: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+stand_kp: 60.0
+stand_kd: 5.0
+ctrl_kp: 30.0
+ctrl_kd: 0.75
+default_angles: [0.0, 0.8, -1.5, 0.0, 0.8, -1.5, 0.0, 0.8, -1.5, 0.0, 0.8, -1.5]
+sit_angles: [0.04, 1.3, -2.87, -0.02, 1.29, -2.86, -0.33, 1.27, -2.81, 0.32, 1.28, -2.87]
+ang_vel_scale: 0.25
+dof_pos_scale: 1.0
+dof_vel_scale: 0.05
+action_scale: 0.25
+num_actions: 12
+num_single_obs: 45
+frame_stack: 20

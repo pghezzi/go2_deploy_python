@@ -3,6 +3,7 @@ control_dt: 0.02        # 50Hz
 communication_dt: 0.002 # 500Hz
 inference_rate_hz: 50.0
 cnn_rate_hz: 10.0
+timing_log_enabled: true # Set false to disable timing file creation and writes.
 timing_log_interval_s: 1.0
 timing_log_path: "logs/depthwaq_timing.log"
 # One PyTorch worker per model thread prevents CPU oversubscription when the
@@ -23,7 +24,7 @@ depth_image_shape: [48, 64]
 # enabled/model_path. Supported modes are instantaneous, ema, and bayes.
 terrain_selector:
   enabled: true
-  model_path: "./models/demo_classifier/terrain_selector_feature_nn_best_seed_0.pt"
+  model_path: "./models/demo_classifier/terrain_selector_feature_nn_best_seed_0_fixed.pt"
   mode: "bayes"
   ema_alpha: 0.6
   change_patience: 1
