@@ -28,12 +28,13 @@ class CameraTap:
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
 
-    def offer(self, frame, scale, receipt_ns):
+    def offer(self, frame, scale, receipt_ns, filtered_depth=None, filter_ms=None, processed_depth=None):
         with self.stats_lock:
             self.offered += 1
             offered, dropped = self.offered, self.dropped
         metadata = {'frame_id': int(frame.get_frame_number()), 'receipt_ns': receipt_ns,
-                    'camera_identity': self.identity,
+                    'camera_identity': self.identity, 'realsense_filter_ms': filter_ms,
+                    'filter_history': 'shared publisher lifetime; filters are not reset by the shadow collector',
                     'sensor_timestamp_ms': frame.get_timestamp(),
                     'sensor_clock': str(frame.get_frame_timestamp_domain()),
                     'depth_scale_m': scale, 'tap_offered': offered, 'tap_dropped': dropped,
@@ -41,7 +42,7 @@ class CameraTap:
                     'raw_units': 'uint16 sensor units; multiply depth_scale_m for meters'}
         raw = np.asanyarray(frame.get_data()).copy()
         try:
-            self.queue.put_nowait((metadata, raw))
+            self.queue.put_nowait((metadata, raw, filtered_depth, processed_depth))
         except queue.Full:
             self.record_drop()
 
@@ -53,7 +54,7 @@ class CameraTap:
         connection = None
         while not self.stop.is_set():
             try:
-                metadata, raw = self.queue.get(timeout=.2)
+                metadata, raw, filtered, processed = self.queue.get(timeout=.2)
             except queue.Empty:
                 continue
             try:
@@ -62,7 +63,10 @@ class CameraTap:
                     connection.settimeout(.5)
                     connection.connect(self.path)
                 buf = io.BytesIO()
-                np.savez(buf, raw=raw, metadata=np.frombuffer(json.dumps(metadata).encode(), np.uint8))
+                extra = {} if filtered is None else {'filtered_depth': filtered}
+                if processed is not None:
+                    extra['processed_depth'] = processed
+                np.savez(buf, **extra, raw=raw, metadata=np.frombuffer(json.dumps(metadata).encode(), np.uint8))
                 payload = buf.getvalue()
                 connection.sendall(struct.pack('!I', len(payload)) + payload)
             except OSError:
@@ -91,4 +95,9 @@ def recv_packet(connection):
     if size > MAX_PACKET:
         raise ValueError('Oversized camera packet')
     with np.load(io.BytesIO(exact(size)), allow_pickle=False) as data:
-        return json.loads(data['metadata'].tobytes()), data['raw'].copy(), None
+        metadata = json.loads(data['metadata'].tobytes())
+        if 'filtered_depth' in data:
+            metadata['_filtered_depth'] = data['filtered_depth'].copy()
+        if 'processed_depth' in data:
+            metadata['_processed_depth'] = data['processed_depth'].copy()
+        return metadata, data['raw'].copy(), None

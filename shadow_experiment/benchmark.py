@@ -6,7 +6,7 @@ from pathlib import Path
 
 import numpy as np
 
-from .core import Pipelines, atomic_json, preprocess, provenance, read_trial
+from .core import replay_depth_input, Pipelines, atomic_json, preprocess, provenance, read_trial
 from .analyze import KEYS, write_csv
 
 
@@ -31,13 +31,13 @@ def benchmark(trial, output, repeats=3, warmup=10, device=None, model_root=None)
             raise ValueError('Saved model hash mismatch')
         for i in range(warmup):
             r, arrays, _ = rows[i % len(rows)]
-            pipelines.run(preprocess(arrays['raw_depth'], r['depth_scale_m'], config['camera']), arrays['rpy'], arrays['omega'])
+            pipelines.run(preprocess(replay_depth_input(arrays, config['camera']), r['depth_scale_m'], config['camera']), arrays['rpy'], arrays['omega'])
         for repeat in range(repeats):
             pipelines.reset()
             for r, arrays, _ in rows:
                 pipelines.sync()
                 start = time.perf_counter_ns()
-                depth = preprocess(arrays['raw_depth'], r['depth_scale_m'], config['camera'])
+                depth = preprocess(replay_depth_input(arrays, config['camera']), r['depth_scale_m'], config['camera'])
                 pre_ms = (time.perf_counter_ns() - start)/1e6
                 result = pipelines.run(depth, arrays['rpy'], arrays['omega'])
                 pipelines.sync()

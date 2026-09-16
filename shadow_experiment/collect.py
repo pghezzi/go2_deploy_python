@@ -1,4 +1,9 @@
 """Dedicated shadow collector: subscribes to state, never imports a controller."""
+from common.dds_runtime import configure_dds_runtime
+
+if __name__ == '__main__':
+    configure_dds_runtime()
+
 import argparse
 from collections import Counter
 import json
@@ -14,18 +19,24 @@ import time
 
 import numpy as np
 
-from .core import GroundTruth, Pipelines, StateBuffer, TrialWriter, load_config, preprocess
+from .core import GroundTruth, Pipelines, StateBuffer, TrialWriter, AsyncTrialWriter, load_config, preprocess, digest
 from .camera_tap import recv_packet
+from common.realsense_filters import make_filters, SETTINGS
 from common.remote_controller import RemoteController, KeyMap
 
 
 class Collector:
     def __init__(self, config):
         self.config = config
-        self.pipelines = Pipelines(config)
+        self.record_only = config['runtime'].get('record_only', False)
+        self.pipelines = None if self.record_only else Pipelines(config)
+        model_metadata = ({name: {'sha256': digest(spec['path']),
+                                  'manifest_sha256': digest(spec['path'] + '.json'), 'seed': spec['seed']}
+                           for name, spec in config['models'].items()} if self.record_only else self.pipelines.metadata)
         self.start_ns = time.monotonic_ns()
         self.truth = GroundTruth(config, self.start_ns)
-        self.writer = TrialWriter(config, self.pipelines.metadata, self.start_ns)
+        writer_class = AsyncTrialWriter if self.record_only else TrialWriter
+        self.writer = writer_class(config, model_metadata, self.start_ns)
         self.states = StateBuffer(config['runtime']['state_buffer_size'])
         self.positions = StateBuffer(config['runtime']['state_buffer_size'])
         self.queue = queue.Queue(config['runtime']['queue_size'])
@@ -165,6 +176,8 @@ class Collector:
                 self.writer.event('crossing_verification', **event)
 
     def process(self, metadata, raw, rgb):
+        filtered_depth = metadata.pop('_filtered_depth', None)
+        processed_depth = metadata.pop('_processed_depth', None)
         now = time.monotonic_ns()
         receipt = metadata['receipt_ns']
         frame_id = metadata['frame_id']
@@ -196,7 +209,7 @@ class Collector:
             self.truth.event['first_frame_id'] = frame_id
             self.writer.event('transition_first_frame', frame_id=frame_id, receipt_ns=receipt)
         period = 1e9 / self.config['runtime']['update_hz']
-        if self.last_capture is not None and receipt - self.last_capture < period:
+        if not (self.record_only and metadata.get('source') == 'publisher_tap') and self.last_capture is not None and receipt - self.last_capture < period:
             reject('rate_decimation')
             return
         if now - receipt > self.config['runtime']['max_input_age_s'] * 1e9:
@@ -216,7 +229,15 @@ class Collector:
             return
         cycle_start = time.perf_counter_ns()
         try:
-            depth = preprocess(raw, metadata['depth_scale_m'], self.config['camera'])
+            if self.config['camera'].get('realsense_filters', False) and filtered_depth is None:
+                raise ValueError('Filtered depth missing: update the shared camera publisher')
+            source_depth = filtered_depth if self.config['camera'].get('realsense_filters', False) else raw
+            if self.record_only:
+                if processed_depth is None or processed_depth.shape != (48, 64) or not np.isfinite(processed_depth).all() or np.any((processed_depth < 0) | (processed_depth > 1)):
+                    raise ValueError('Recording requires processed depth from updated deployment publisher')
+                depth = processed_depth
+            else:
+                depth = preprocess(source_depth, metadata['depth_scale_m'], self.config['camera'])
         except ValueError as error:
             self.writer.event('invalid_depth', frame_id=frame_id, error=str(error))
             self.counters['invalid_depth'] += 1
@@ -224,7 +245,7 @@ class Collector:
             return
         preprocess_ms = (time.perf_counter_ns() - cycle_start) / 1e6
         try:
-            result = self.pipelines.run(depth, state['rpy'], state['omega'])
+            result = {} if self.record_only else self.pipelines.run(depth, state['rpy'], state['omega'])
         except Exception:
             # Do not allow partially advanced filter banks to continue silently.
             self.termination = 'pipeline_error'
@@ -246,7 +267,10 @@ class Collector:
                   'annotation_transition': self.truth.event, 'verified_crossing': self.truth.crossing,
                   'valid_for_analysis': valid, 'exclusion_reason': None if valid else 'configured_uncertain_interval',
                   'processing_start_ns': now, 'processing_end_ns': end,
-                  'preprocess_ms': preprocess_ms, 'six_pipeline_cycle_ms': total_ms,
+                  'execution_mode': 'record_only' if self.record_only else 'online',
+                  'capture_prepare_ms': preprocess_ms, 'capture_cycle_ms': total_ms,
+                  'preprocess_ms': None if self.record_only else preprocess_ms,
+                  'six_pipeline_cycle_ms': None if self.record_only else total_ms,
                   'update_interval_ms': None if self.last_update is None else (now - self.last_update) / 1e6,
                   'input_age_ms': (now - receipt) / 1e6,
                   'state_alignment_age_ms': (receipt - state['receipt_ns']) / 1e6,
@@ -254,7 +278,11 @@ class Collector:
                   'compute_deadline_miss': total_ms * 1e6 > period,
                   'counters': dict(self.counters),
                   'state_buffer_evictions': self.states.evictions}
-        self.writer.add(record, raw, depth, state['rpy'], state['omega'], rgb)
+        admitted = self.writer.add(record, raw, depth, state['rpy'], state['omega'], rgb, filtered_depth=filtered_depth)
+        if admitted is False:
+            reject('writer_queue_drop_new')
+            self.last_capture, self.last_update = receipt, now
+            return
         self.counters['accepted'] += 1
         self.last_capture, self.last_update = receipt, now
 
@@ -270,6 +298,8 @@ class Collector:
         reason = 'operator_stop'
         try:
             while not self.stop.is_set():
+                if self.record_only:
+                    self.writer.check_error()
                 self.log_drops()
                 self.commands_pending()
                 if self.config['transition']['type'] == 'time':
@@ -326,12 +356,14 @@ def realsense_source(collector):
     cfg.enable_stream(rs.stream.depth, w, h, rs.format.z16, c['fps'])
     if c['rgb']:
         cfg.enable_stream(rs.stream.color, w, h, rs.format.rgb8, c['fps'])
+    filters = make_filters(rs) if c.get('realsense_filters', False) else []
     profile = pipeline.start(cfg)
     scale = profile.get_device().first_depth_sensor().get_depth_scale()
     device = profile.get_device()
     collector.writer.event('camera_identity', serial=device.get_info(rs.camera_info.serial_number),
                            firmware=device.get_info(rs.camera_info.firmware_version),
                            name=device.get_info(rs.camera_info.name), depth_scale_m=scale,
+                           realsense_filters=SETTINGS if filters else None,
                            intrinsics=str(profile.get_stream(rs.stream.depth).as_video_stream_profile().get_intrinsics()))
     try:
         while not collector.stop.is_set():
@@ -352,6 +384,13 @@ def realsense_source(collector):
                         'rgb_sensor_clock': str(color.get_frame_timestamp_domain()) if color else None,
                         'rgb_frame_id': int(color.get_frame_number()) if color else None,
                         'source': 'realsense', 'rgb_alignment': 'same frameset, unregistered color view'}
+            if filters:
+                started = time.perf_counter_ns()
+                filtered = depth
+                for transform in filters:
+                    filtered = transform.process(filtered)
+                metadata['_filtered_depth'] = np.asanyarray(filtered.get_data()).copy()
+                metadata['realsense_filter_ms'] = (time.perf_counter_ns()-started)/1e6
             collector.offer(metadata, np.asanyarray(depth.get_data()).copy(),
                             np.asanyarray(color.get_data()).copy() if color else None)
     finally:

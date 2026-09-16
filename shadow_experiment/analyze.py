@@ -7,7 +7,7 @@ from pathlib import Path
 
 import numpy as np
 
-from .core import CLASSES, MODES, Pipelines, atomic_json, canonical, digest, preprocess, provenance, read_trial
+from .core import replay_depth_input, CLASSES, MODES, Pipelines, atomic_json, canonical, digest, preprocess, provenance, read_trial
 from .reference_metrics import evaluate_transition_accounting, _false_transition_rate
 
 COLORS = {'rough': '#777777', 'gap': '#0072B2', 'stairs': '#E69F00', 'climb': '#009E73'}
@@ -19,6 +19,7 @@ def validate(manifest, rows, issues):
     last_id, last_receipt, previous_label = None, None, 'rough'
     changes = 0
     c = manifest['config']
+    recording = c['runtime'].get('record_only', False) and manifest.get('execution_mode') != 'offline_inference'
     event = manifest.get('transition')
     if event is None:
         events = [r[0].get('annotation_transition') for r in rows if r[0].get('annotation_transition')]
@@ -36,15 +37,15 @@ def validate(manifest, rows, issues):
         if previous_label != record['ground_truth']:
             changes += 1
         previous_label = record['ground_truth']
-        if set(record['selectors']) != set(KEYS) or set(record['models']) != {'feature', 'raw'}:
+        if not recording and set(record['selectors']) != set(KEYS) or (not recording and set(record['models']) != {'feature', 'raw'}):
             issues.append('incomplete_six_pipeline_frame')
-        if arrays['depth'].shape != (48, 64) or not np.isfinite(arrays['depth']).all() or np.any((arrays['depth'] < 0) | (arrays['depth'] > 1)):
+        if not recording and (arrays['depth'].shape != (48, 64) or not np.isfinite(arrays['depth']).all() or np.any((arrays['depth'] < 0) | (arrays['depth'] > 1))):
             issues.append('invalid_processed_depth')
         if not np.array_equal(arrays['rpy'], np.asarray(record['state']['rpy'], np.float32)) or not np.array_equal(arrays['omega'], np.asarray(record['state']['omega'], np.float32)):
             issues.append('state_input_mismatch')
         if not 0 <= stamp - record['state']['receipt_ns'] <= c['runtime']['max_state_age_s'] * 1e9:
             issues.append('invalid_state_alignment')
-        for key, output in record['selectors'].items():
+        for key, output in record.get('selectors', {}).items():
             dist = np.asarray(output['distribution'])
             if dist.shape != (4,) or not np.isfinite(dist).all() or (dist < 0).any() or not np.isclose(dist.sum(), 1, atol=1e-5):
                 issues.append('invalid_distribution')
@@ -59,6 +60,8 @@ def validate(manifest, rows, issues):
 
 def replay(path, device=None, atol=1e-6, model_root=None):
     manifest, rows, issues = read_trial(path)
+    if manifest['config']['runtime'].get('record_only', False) and manifest.get('execution_mode') != 'offline_inference':
+        raise ValueError('Run python -m shadow_experiment.infer first to generate offline outputs')
     issues, _ = validate(manifest, rows, issues)
     config = json.loads(json.dumps(manifest['config']))
     if device:
@@ -75,7 +78,7 @@ def replay(path, device=None, atol=1e-6, model_root=None):
     for record, arrays, _ in rows:
         result = pipelines.run(arrays['depth'], arrays['rpy'], arrays['omega'])
         frame_errors = []
-        reconstructed = preprocess(arrays['raw_depth'], record['depth_scale_m'], config['camera'])
+        reconstructed = preprocess(replay_depth_input(arrays, config['camera']), record['depth_scale_m'], config['camera'])
         if not np.allclose(reconstructed, arrays['depth'], atol=atol, rtol=0):
             frame_errors.append('preprocessed_depth')
         for name in ('feature', 'raw'):
@@ -157,8 +160,11 @@ def trial_metrics(manifest, rows, event, path):
         percentile = lambda v, q: float(np.percentile(v, q)) if v else None
         result.append({'trial': str(path), 'trial_id': cfg['trial_id'], 'experiment': cfg['experiment'],
                        'configuration': cfg['configuration'], 'target': cfg['target_class'], 'difficulty': cfg['difficulty'],
+                       'execution_mode': manifest.get('execution_mode', 'online'),
+                       'timing_scope': manifest.get('timing_scope', 'concurrent shadow selector timings'),
                        'pipeline': key, 'accepted_frames': len(rows), 'valid_frames': len(records),
                        'capture_queue_drops': manifest.get('counters', {}).get('capture_queue_drop_new', 0),
+                       'writer_queue_drops': manifest.get('counters', {}).get('writer_queue_drop_new', 0),
                        'stale_host_frames': manifest.get('counters', {}).get('stale_host_input', 0),
                        'missing_or_stale_state_frames': manifest.get('counters', {}).get('missing_or_stale_state', 0),
                        'excluded_frames': len(rows)-len(records), 'accuracy': float((gt == predicted).mean()) if len(gt) else None,
@@ -176,8 +182,10 @@ def trial_metrics(manifest, rows, event, path):
                        'transition_missed': transition['missed'] if transition else None,
                        'first_match_delay_frames': transition['delay_classification_frames'] if transition and transition['matched'] else None,
                        'first_match_delay_s': delay_s,
-                       'concurrent_component_p50_ms': percentile(latency, 50),
-                       'concurrent_component_p95_ms': percentile(latency, 95),
+                       'offline_component_p50_ms': percentile(latency, 50) if manifest.get('execution_mode') == 'offline_inference' else None,
+                       'offline_component_p95_ms': percentile(latency, 95) if manifest.get('execution_mode') == 'offline_inference' else None,
+                       'concurrent_component_p50_ms': None if manifest.get('execution_mode') == 'offline_inference' else percentile(latency, 50),
+                       'concurrent_component_p95_ms': None if manifest.get('execution_mode') == 'offline_inference' else percentile(latency, 95),
                        'six_pipeline_cycle_p95_ms': percentile(values('six_pipeline_cycle_ms'), 95),
                        'update_interval_p95_ms': percentile(values('update_interval_ms'), 95),
                        'input_age_p95_ms': percentile(values('input_age_ms'), 95),
@@ -199,6 +207,7 @@ def group_key(manifest):
     cfg = dict(manifest['config'])
     for key in ('trial_id', 'output_root', 'reference_repo'):
         cfg.pop(key, None)
+    cfg['execution_mode'] = manifest.get('execution_mode', 'online')
     cfg['models'] = {name: {'sha256': m['sha256'], 'manifest_sha256': m['manifest_sha256']} for name, m in manifest['models'].items()}
     # Recording identifiers/paths don't change the physical setup; all settings do.
     return hashlib.sha256(canonical(cfg).encode()).hexdigest()[:12]
@@ -317,6 +326,9 @@ def report(root, output, appendix=False):
                 continue
             manifest, rows, issues = read_trial(file.parent)
             issues, event = validate(manifest, rows, issues)
+            if manifest['config']['runtime'].get('record_only', False) and manifest.get('execution_mode') != 'offline_inference':
+                validation.append({'trial': str(file.parent), 'issues': issues + ['offline_inference_required'], 'aggregate_eligible': False})
+                continue
             serious = [i for i in issues if i not in ('unclosed_trial', 'unfinished_temporary_write') and not i.startswith('recovered_unindexed_chunk:')]
             # Recovered trials remain replayable, but don't masquerade as complete repeats.
             eligible = not serious and manifest['complete'] and not manifest.get('counters', {}).get('capture_shutdown_timeout') and manifest.get('termination_reason') not in ('pipeline_error', 'source_or_processing_error')

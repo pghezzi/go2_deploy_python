@@ -5,6 +5,7 @@ from importlib import metadata as package_metadata
 import json
 import os
 import platform
+import queue
 import re
 import subprocess
 import time
@@ -68,7 +69,7 @@ def provenance(config):
         except package_metadata.PackageNotFoundError:
             versions[name] = None
     files = [*Path(__file__).parent.glob('*.py'), ROOT / 'terrain_selector.py',
-             ROOT / 'common/depth_processing.py', ROOT / 'rough_depth_image.py']
+             ROOT / 'common/dds_runtime.py', ROOT / 'common/realsense_filters.py', ROOT / 'common/depth_processing.py', ROOT / 'rough_depth_image.py']
     return {
         'packages': versions,
         'inspected_reference': json.loads((Path(__file__).parent / 'reference_snapshot.json').read_text()),
@@ -145,15 +146,14 @@ def load_config(path, trial_id=None):
         raise ValueError('RGB requires direct realsense capture')
     if cam['preprocessing'] not in ('training_bicubic', 'deployment_tensor_only'):
         raise ValueError('Unknown preprocessing')
-    if cam['preprocessing'] == 'deployment_tensor_only' and cam.get('realsense_filters', False):
-        raise ValueError('This collector records unfiltered raw Z16; hardware RS filters are not available in replay')
-    if cam.get('realsense_filters', False):
-        raise ValueError('Synthetic training noise and stateful RS filters are not applied to raw hardware captures')
     runtime = c['runtime']
+    runtime.setdefault('writer_queue_size', 32)
+    if not isinstance(runtime.get('record_only', False), bool):
+        raise ValueError('runtime.record_only must be boolean')
     for k in ('update_hz', 'queue_size', 'state_buffer_size', 'chunk_frames', 'max_state_age_s', 'max_input_age_s'):
         if not np.isfinite(runtime[k]) or runtime[k] <= 0:
             raise ValueError('runtime.' + k + ' must be positive')
-    for k in ('queue_size', 'state_buffer_size', 'chunk_frames', 'torch_threads'):
+    for k in ('queue_size', 'state_buffer_size', 'chunk_frames', 'torch_threads', 'writer_queue_size'):
         if isinstance(runtime[k], bool) or int(runtime[k]) != runtime[k] or runtime[k] < 1:
             raise ValueError('runtime.' + k + ' must be a positive integer')
     for interval in c['analysis']['excluded_intervals_s']:
@@ -353,7 +353,7 @@ class TrialWriter:
         self.path.mkdir(exist_ok=False)
         (self.path / 'resolved.yaml').write_text(yaml.safe_dump(config, sort_keys=False))
         snapshot = self.path / 'source_snapshot'
-        for source in [*Path(__file__).parent.glob('*.py'), ROOT / 'terrain_selector.py', ROOT / 'common/depth_processing.py', ROOT / 'rough_depth_image.py']:
+        for source in [*Path(__file__).parent.glob('*.py'), ROOT / 'terrain_selector.py', ROOT / 'common/dds_runtime.py', ROOT / 'common/realsense_filters.py', ROOT / 'common/depth_processing.py', ROOT / 'rough_depth_image.py']:
             target = snapshot / source.relative_to(ROOT)
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(source.read_bytes())
@@ -365,7 +365,7 @@ class TrialWriter:
                          'start_wall_ns': time.time_ns(), 'complete': False,
                          'termination_reason': 'unclosed', 'chunks': [], 'frame_count': 0}
         atomic_json(self.path / 'manifest.json', self.manifest)
-        self.event('reset', filters='all six reset', ground_truth='rough', start_ns=start_ns)
+        self.event('reset', filters='not instantiated' if config['runtime'].get('record_only', False) else 'all six reset', ground_truth='rough', start_ns=start_ns)
 
     def event(self, kind, **data):
         with self.event_lock:
@@ -373,8 +373,8 @@ class TrialWriter:
             self.events.flush()
             os.fsync(self.events.fileno())
 
-    def add(self, record, raw, depth, rpy, omega, rgb=None):
-        self.pending.append((record, raw.copy(), depth.copy(), np.array(rpy, np.float32), np.array(omega, np.float32), None if rgb is None else rgb.copy()))
+    def add(self, record, raw, depth, rpy, omega, rgb=None, filtered_depth=None):
+        self.pending.append((record, raw.copy(), depth.copy(), np.array(rpy, np.float32), np.array(omega, np.float32), None if rgb is None else rgb.copy(), None if filtered_depth is None else filtered_depth.copy()))
         if len(self.pending) >= self.config['runtime']['chunk_frames']:
             self.flush()
 
@@ -384,6 +384,8 @@ class TrialWriter:
         name = 'frames_{:06d}.npz'.format(len(self.chunks))
         path = self.path / name
         arrays = {k: np.stack([r[i] for r in self.pending]) for k, i in [('raw_depth', 1), ('depth', 2), ('rpy', 3), ('omega', 4)]}
+        if all(r[6] is not None for r in self.pending):
+            arrays['filtered_depth'] = np.stack([r[6] for r in self.pending])
         arrays['records_utf8'] = np.frombuffer(canonical([r[0] for r in self.pending]).encode(), np.uint8)
         for i, row in enumerate(self.pending):
             if row[5] is not None:
@@ -415,6 +417,89 @@ class TrialWriter:
         self.events.close()
 
 
+class AsyncTrialWriter(TrialWriter):
+    """Single background owner of frame chunks; bounded, nonblocking admission.
+
+    Events retain their existing synchronous durability. Frame data is copied
+    before admission so callbacks cannot mutate queued records or arrays.
+    """
+    def __init__(self, config, model_metadata, start_ns):
+        super().__init__(config, model_metadata, start_ns)
+        self.queue = queue.Queue(config['runtime'].get('writer_queue_size', 32))
+        self.stopping = threading.Event()
+        self.worker_error = None
+        self.closed = False
+        self.stats = {'enqueued': 0, 'queue_dropped': 0, 'queue_high_watermark': 0}
+        self.worker = threading.Thread(target=self._write_frames, name='shadow-frame-writer', daemon=True)
+        self.worker.start()
+
+    def check_error(self):
+        if self.worker_error is not None:
+            raise RuntimeError('Background frame writer failed: ' + repr(self.worker_error)) from self.worker_error
+
+    def add(self, record, raw, depth, rpy, omega, rgb=None, filtered_depth=None):
+        self.check_error()
+        if self.stopping.is_set():
+            raise RuntimeError('Frame writer is closing')
+        # One producer (Collector.process), one consumer. Deep-copy nested
+        # annotation dictionaries, which can change as a trial progresses.
+        row = (copy.deepcopy(record), raw.copy(), depth.copy(), np.array(rpy, np.float32),
+               np.array(omega, np.float32), None if rgb is None else rgb.copy(),
+               None if filtered_depth is None else filtered_depth.copy())
+        try:
+            self.queue.put_nowait(row)
+        except queue.Full:
+            self.stats['queue_dropped'] += 1
+            return False
+        self.stats['enqueued'] += 1
+        self.stats['queue_high_watermark'] = max(self.stats['queue_high_watermark'], self.queue.qsize())
+        return True
+
+    def _write_frames(self):
+        try:
+            while not self.stopping.is_set() or not self.queue.empty():
+                try:
+                    row = self.queue.get(timeout=.05)
+                except queue.Empty:
+                    continue
+                try:
+                    self.pending.append(row)
+                    if len(self.pending) >= self.config['runtime']['chunk_frames']:
+                        super().flush()
+                finally:
+                    self.queue.task_done()
+            super().flush()
+        except Exception as error:
+            self.worker_error = error
+
+    def flush(self):
+        # Only the background thread flushes frame chunks during collection.
+        # close() joins it before TrialWriter.close() calls this method.
+        if self.worker.is_alive():
+            raise RuntimeError('Use close() to drain the asynchronous frame writer')
+        self.check_error()
+        super().flush()
+
+    def close(self, reason, truth, counters):
+        if self.closed:
+            return
+        self.stopping.set()
+        self.worker.join()  # Drain all admitted frames, including the partial chunk.
+        self.manifest['writer'] = dict(self.stats, queue_capacity=self.queue.maxsize)
+        try:
+            if self.worker_error is not None:
+                self.manifest.update(complete=False, termination_reason='writer_error',
+                                     writer_error=repr(self.worker_error), counters=counters,
+                                     transition=truth.event, verified_crossing=truth.crossing,
+                                     approach_only=truth.event is None, end_monotonic_ns=time.monotonic_ns())
+                atomic_json(self.path / 'manifest.json', self.manifest)
+                self.check_error()
+            super().close(reason, truth, counters)
+        finally:
+            self.closed = True
+            self.events.close()
+
+
 def read_trial(path):
     """Discover atomic chunks even if interrupted between rename and manifest update."""
     path = Path(path)
@@ -443,7 +528,7 @@ def read_trial(path):
                 if any(len(data[k]) != len(records) for k in ('raw_depth', 'depth', 'rpy', 'omega')):
                     raise ValueError('Chunk array lengths disagree with records')
                 for i, record in enumerate(records):
-                    rows.append((record, {k: data[k][i].copy() for k in ('raw_depth', 'depth', 'rpy', 'omega')},
+                    rows.append((record, {k: data[k][i].copy() for k in ('raw_depth', 'depth', 'rpy', 'omega', *(['filtered_depth'] if 'filtered_depth' in data else []))},
                                  data['rgb_{:04d}'.format(i)].copy() if 'rgb_{:04d}'.format(i) in data else None))
         except (ValueError, OSError, KeyError) as error:
             issues.append('unreadable_chunk:' + item.name + ':' + str(error))
@@ -470,3 +555,11 @@ def read_trial(path):
     if list(path.glob('*.tmp')):
         issues.append('unfinished_temporary_write')
     return manifest, rows, issues
+
+
+def replay_depth_input(arrays, camera):
+    if camera.get('realsense_filters', False):
+        if 'filtered_depth' not in arrays:
+            raise ValueError('Filtered trial is missing saved filtered depth')
+        return arrays['filtered_depth']
+    return arrays['raw_depth']

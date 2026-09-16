@@ -33,13 +33,13 @@ filters:
   change_patience: 1
   stable_stay: 0.9
 camera:
-  source: realsense
+  source: publisher_tap
   socket_path: /tmp/go2_shadow_camera.sock
   resolution:
   - 480
   - 640
   fps: 30
-  preprocessing: training_bicubic
+  preprocessing: deployment_tensor_only
   cropping:
   - 48
   - 0
@@ -49,10 +49,12 @@ camera:
   - 0.0
   - 3.0
   rotate_180: false
-  realsense_filters: false
+  realsense_filters: true
   rgb: false
   max_rgb_skew_ms: 20
 runtime:
+  writer_queue_size: 32 # Frames waiting for background compression/write
+  record_only: true # Save sensor inputs; run classifiers offline
   device: cpu
   seed: 0
   torch_threads: 1

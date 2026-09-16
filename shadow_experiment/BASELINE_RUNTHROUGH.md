@@ -1,3 +1,58 @@
+## Background frame recording
+
+Recording-only collection sends owned frame/metadata snapshots to a background
+writer. `runtime.writer_queue_size: 32` bounds waiting frames (plus one chunk
+being assembled/written). At 640x480, raw + filtered depth use roughly 38 MiB
+for 32 waiting frames, excluding chunk/compression workspace and optional RGB.
+The collector does not wait for compression or frame file writes. Overflow is
+logged as `writer_queue_drop_new`, separate from capture-queue drops, and breaks
+the analysis continuity segment. Accepted counts include admitted frames; the
+manifest frame count describes committed data. The final manifest includes writer
+queue capacity, high-water mark, admission and overflow counts.
+
+On stop, Ctrl+C or SIGTERM, the writer drains admitted frames and commits its last
+partial chunk before closing. Allow shutdown to finish. A force kill can lose
+queued frames; completed atomic chunks remain recoverable. Disk failures stop
+collection and leave the trial incomplete. Event logging retains its existing
+synchronous durability. The saved trial format and offline inference commands
+are unchanged; latency tests do not use this recording queue.
+
+## Recording with the Unitree controller (current workflow)
+
+Run the deployment depth node and recording-only collector in separate processes:
+
+```bash
+python -u -m shadow_experiment.record --config configs/shadow/rough_to_gap.yaml --trial-id 002 --interface eth0
+```
+
+The launcher owns the camera; stop any previous camera publisher before launching.
+It starts no locomotion controller. Operate using the Unitree controller, press B
+once to annotate the transition, then type `stop` or press Ctrl+C to finish.
+Use a new trial ID each time. The publisher restarts for every trial, resetting
+RealSense temporal history. It uses the trial camera configuration and processes
+at `runtime.update_hz`, with a bounded asynchronous socket sender. The collector
+saves raw, filtered and exact normalized 48x64 depth, aligned state, annotations,
+timestamps and drop counters. It loads no classifiers and repeats no resizing.
+RGB is unavailable through this publisher. Disk recording can still drop frames;
+inspect counters after each trial. Recorded timing is acquisition/recording timing,
+not classifier latency.
+
+Copy the trial to the analysis machine and generate a separate derived trial:
+
+```bash
+python -m shadow_experiment.infer /path/to/recorded_trial --output offline_trials/trial002 --model-root models/classifiers_latest_offline
+python -m shadow_experiment.analyze report offline_trials --output shadow_report
+```
+
+All six selectors run offline, once per recorded frame in timestamp order, with
+fresh filter state per trial and verified model hashes. Original recordings are
+preserved. Derived manifests and per-trial CSVs identify offline execution and
+its host; inference timings are **not robot deployment latency**. Reports retain
+historical timing column names; consult `execution_mode` and `timing_scope`.
+For robot latency use the separate saved-input isolated benchmark on the robot.
+The older online collection instructions below apply only with
+`runtime.record_only: false`.
+
 # Run a Go2 shadow experiment with our baseline controller
 
 Use three terminals on the robot: **A for the shared camera**, **B for the fixed
@@ -34,6 +89,8 @@ camera:
   source: publisher_tap
   socket_path: /tmp/go2_shadow_camera.sock
   rgb: false
+  realsense_filters: true
+  preprocessing: deployment_tensor_only
 
 runtime:
   duration_s: 120
@@ -94,9 +151,10 @@ drops frames while no collector is connected and retries on subsequent frames.
 Those earlier losses appear in its cumulative counters.
 
 Keep this process running between trials. The publisher and shadow configuration
-must agree on raw camera resolution; the example uses 640×480. Their subsequent
-tensor preprocessing is separately configured and recorded, as explained in the
-experiment reference.
+must agree on raw camera resolution; the example uses 640×480. The examples use the same RealSense filters, crop endpoints, and adaptive-average
+pooling as robot control. The tap supplies already-filtered depth alongside raw
+depth; shadow collection does not apply the filters a second time. Update and
+restart the publisher as well as the collector when using this feature.
 
 ## 4. Terminal B: start the baseline controller
 

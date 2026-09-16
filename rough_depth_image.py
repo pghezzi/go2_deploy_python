@@ -1,3 +1,8 @@
+from common.dds_runtime import configure_dds_runtime
+
+if __name__ == '__main__':
+    configure_dds_runtime()
+
 import time
 import numpy as np
 import torch
@@ -104,48 +109,9 @@ class DepthImagePublisher:
         # Same filters/settings as VisualHandlerNode
         # ============================================================
 
-        self.rs_hole_filling_filter = rs.hole_filling_filter()
-
-        self.rs_spatial_filter = rs.spatial_filter()
-
-        self.rs_spatial_filter.set_option(
-            rs.option.filter_magnitude,
-            5,
-        )
-
-        self.rs_spatial_filter.set_option(
-            rs.option.filter_smooth_alpha,
-            0.75,
-        )
-
-        self.rs_spatial_filter.set_option(
-            rs.option.filter_smooth_delta,
-            1,
-        )
-
-        self.rs_spatial_filter.set_option(
-            rs.option.holes_fill,
-            4,
-        )
-
-        self.rs_temporal_filter = rs.temporal_filter()
-
-        self.rs_temporal_filter.set_option(
-            rs.option.filter_smooth_alpha,
-            0.75,
-        )
-
-        self.rs_temporal_filter.set_option(
-            rs.option.filter_smooth_delta,
-            1,
-        )
-
-        # Exact same order as VisualHandlerNode
-        self.rs_filters = [
-            self.rs_hole_filling_filter,
-            self.rs_spatial_filter,
-            self.rs_temporal_filter,
-        ]
+        from common.realsense_filters import make_filters
+        self.rs_filters = make_filters(rs)
+        self.rs_hole_filling_filter, self.rs_spatial_filter, self.rs_temporal_filter = self.rs_filters
 
         # ============================================================
         # DDS setup
@@ -201,8 +167,12 @@ class DepthImagePublisher:
 
     def preprocess_depth(self, depth_frame):
         """Apply parkour's RealSense filters, then its tensor preprocessing."""
+        filter_start = time.perf_counter_ns()
         for rs_filter in self.rs_filters:
             depth_frame = rs_filter.process(depth_frame)
+        if self.shadow_tap is not None:
+            self._shadow_filter_ms = (time.perf_counter_ns() - filter_start) / 1e6
+            self._shadow_filtered_depth = np.asanyarray(depth_frame.get_data()).copy()
         return preprocess_depth_array(
             np.asanyarray(depth_frame.get_data()),
             depth_scale=self.depth_scale,
@@ -226,17 +196,18 @@ class DepthImagePublisher:
             print("No depth frame")
             return
 
-        if self.shadow_tap is not None:
-            try:
-                self.shadow_tap.offer(depth_frame, self.depth_scale, receipt_ns)
-            except Exception as error:
-                self.shadow_tap.record_drop()
-                print(f"Shadow camera tap ignored an error: {error}", flush=True)
-
         # Preprocess exactly like the deployment pipeline
         normalized = self.preprocess_depth(
             depth_frame
         )
+
+        if self.shadow_tap is not None:
+            try:
+                self.shadow_tap.offer(depth_frame, self.depth_scale, receipt_ns, self._shadow_filtered_depth, self._shadow_filter_ms, normalized.copy())
+            except Exception as error:
+                self.shadow_tap.record_drop()
+                print(f"Shadow camera tap ignored an error: {error}", flush=True)
+
 
         # ------------------------------------------------------------
         # Sanity checks

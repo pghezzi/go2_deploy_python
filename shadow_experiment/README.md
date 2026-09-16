@@ -1,3 +1,126 @@
+## Memory statistics in the live latency test
+
+Each measured call now records `process_rss_mib` after inference, outside the
+latency timer. Per-pipeline `summary.csv` and terminal output include its mean
+and sample standard deviation (`ddof=1`). RSS is current resident RAM from
+`/proc/self/statm`, measured in MiB; it includes this process's Python, DDS,
+input buffers and allocator caches, and excludes the separate depth publisher.
+It is not model-only memory or a transient peak measurement. Pipelines run in
+one process, so caches retained from earlier pipelines may affect later values.
+CUDA runs also log `cuda_allocated_mib` and `cuda_reserved_mib` with mean/std;
+CPU runs leave these fields empty. These CUDA figures cover the PyTorch allocator,
+not total GPU use. Do not add them to RSS on the robot's unified-memory hardware.
+No command-line changes are required. Existing result files remain unchanged.
+
+## Background frame recording
+
+Recording-only collection sends owned frame/metadata snapshots to a background
+writer. `runtime.writer_queue_size: 32` bounds waiting frames (plus one chunk
+being assembled/written). At 640x480, raw + filtered depth use roughly 38 MiB
+for 32 waiting frames, excluding chunk/compression workspace and optional RGB.
+The collector does not wait for compression or frame file writes. Overflow is
+logged as `writer_queue_drop_new`, separate from capture-queue drops, and breaks
+the analysis continuity segment. Accepted counts include admitted frames; the
+manifest frame count describes committed data. The final manifest includes writer
+queue capacity, high-water mark, admission and overflow counts.
+
+On stop, Ctrl+C or SIGTERM, the writer drains admitted frames and commits its last
+partial chunk before closing. Allow shutdown to finish. A force kill can lose
+queued frames; completed atomic chunks remain recoverable. Disk failures stop
+collection and leave the trial incomplete. Event logging retains its existing
+synchronous durability. The saved trial format and offline inference commands
+are unchanged; latency tests do not use this recording queue.
+
+## Robot DDS runtime
+
+Camera and shadow entry points select `~/cyclonedds-0.10.2` on ARM64 when
+installed. This fixes the verified native write crash with the robot's
+`/usr/local/lib/libddsc.so` (Iceoryx path). Selection changes only these processes
+and their children; system DDS libraries and Unitree services are untouched.
+`GO2_CYCLONEDDS_HOME` can explicitly select another installation. The process
+restarts once before importing DDS so both Python and native dependencies use
+the same installation. Camera settings and depth message format are unchanged.
+
+## Live-frame robot latency test
+
+```bash
+python -u -m shadow_experiment.live_latency \
+  --config configs/shadow/rough_to_climb.yaml \
+  --output latency_results/live_run001 --iterations 1000 --warmup 50 --interface eth0
+```
+
+Run on the robot with other camera publishers/collection stopped. This starts the
+existing deployment depth node in a separate process, subscribes to robot state,
+and runs just one classifier/filter pipeline at a time. Each call waits for a
+new capture acquired after the previous call; duplicate, old and unaligned inputs
+are excluded and counted. Frame waiting and camera preprocessing are outside the
+classifier/filter timer. Each pipeline has 50 warmup calls, then a filter reset
+and 1,000 measured calls. No motor commands or control-mode changes are sent.
+Results are written incrementally on the robot under the specified directory:
+per-pipeline samples, mean/sample-standard-deviation summary, camera log and
+provenance manifest. Six pipelines at 10 Hz take at least 10.5 minutes, longer if
+frames are skipped. Different pipelines see different live images; keep the
+scene and robot workload stable. These measurements include contention with the
+async camera node. Use the saved-input test below for identical-input comparisons.
+
+## Controlled robot latency test
+
+Run on the robot while collection and custom controllers are stopped:
+
+```bash
+python -m shadow_experiment.latency /path/to/recorded_trial \
+  --output latency_results/run001 --iterations 1000 --warmup 50 --device cpu
+```
+
+Each of the six classifier/filter pipelines runs separately, with 50 unmeasured
+warmup calls and exactly 1,000 measured calls. All use the same saved normalized
+depth/state sequence, held in RAM. Filters reset after warmup and retain state
+through measured calls. No camera, resizing, disk reads, or specialist execution
+is timed. Calls include tensor conversion, transfers, validation and output
+packaging from the existing pipeline. CUDA execution is synchronized when selected.
+The benchmark uses one Torch intra-op and inter-op thread. Results stay in the
+specified directory on the machine executing the command: per-call CSVs,
+`summary.csv` (mean, sample standard deviation and p95 for total/classifier/filter),
+and `manifest.json` recording hardware/software, model hashes and test settings.
+Use a new output directory; existing runs are never overwritten. This is a
+sequential microbenchmark, not a guarantee under concurrent robot workloads.
+
+## Recording with the Unitree controller (current workflow)
+
+Run the deployment depth node and recording-only collector in separate processes:
+
+```bash
+python -u -m shadow_experiment.record --config configs/shadow/rough_to_gap.yaml --trial-id 002 --interface eth0
+```
+
+The launcher owns the camera; stop any previous camera publisher before launching.
+It starts no locomotion controller. Operate using the Unitree controller, press B
+once to annotate the transition, then type `stop` or press Ctrl+C to finish.
+Use a new trial ID each time. The publisher restarts for every trial, resetting
+RealSense temporal history. It uses the trial camera configuration and processes
+at `runtime.update_hz`, with a bounded asynchronous socket sender. The collector
+saves raw, filtered and exact normalized 48x64 depth, aligned state, annotations,
+timestamps and drop counters. It loads no classifiers and repeats no resizing.
+RGB is unavailable through this publisher. Disk recording can still drop frames;
+inspect counters after each trial. Recorded timing is acquisition/recording timing,
+not classifier latency.
+
+Copy the trial to the analysis machine and generate a separate derived trial:
+
+```bash
+python -m shadow_experiment.infer /path/to/recorded_trial --output offline_trials/trial002 --model-root models/classifiers_latest_offline
+python -m shadow_experiment.analyze report offline_trials --output shadow_report
+```
+
+All six selectors run offline, once per recorded frame in timestamp order, with
+fresh filter state per trial and verified model hashes. Original recordings are
+preserved. Derived manifests and per-trial CSVs identify offline execution and
+its host; inference timings are **not robot deployment latency**. Reports retain
+historical timing column names; consult `execution_mode` and `timing_scope`.
+For robot latency use the separate saved-input isolated benchmark on the robot.
+The older online collection instructions below apply only with
+`runtime.record_only: false`.
+
 # Go2 shadow-mode terrain-selection experiment
 
 For an end-to-end procedure using our fixed rough/baseline controller, follow
@@ -119,8 +242,8 @@ Use the robot's existing Python environment with Torch, NumPy, PyYAML,
 `unitree_sdk2py`, CycloneDDS, and pyrealsense2. Offline reporting additionally
 needs matplotlib; it does not import camera or DDS libraries.
 
-**Direct camera ownership** (default): use an independent controller that does
-not also open this RealSense device. The collector opens only camera streams:
+**Direct camera ownership** (set `camera.source: realsense` explicitly): use an
+independent controller that does not also open this RealSense device. The collector opens only camera streams:
 
 ```bash
 cd ~/go2_deploy_python
@@ -135,7 +258,8 @@ configured duration, on `stop` + Enter, or on SIGINT/SIGTERM. No mode switch or
 motor stop command is sent by the collector; robot operation remains with the
 independent controller/operator.
 
-**Share the existing depth publisher** if the independent controller needs the
+**Share the existing depth publisher** (the example configs default to this) if
+the independent controller needs the
 same camera. Set `camera.source: publisher_tap`, `camera.rgb: false`, and use the
 same `socket_path` on both sides. Start the collector first, then start the depth
 publisher with an optional tap:
@@ -152,7 +276,8 @@ python rough_depth_image.py --interface eth0 --config configs/single_policy.yaml
 
 Operate the locomotion controller separately as usual. Do not launch a second
 camera publisher through a combined controller launcher in this arrangement.
-The tap sends original Z16 frames before the existing publisher's filters. It is
+The tap sends both original Z16 and the publisher's filtered depth, before tensor
+cropping/resizing. Filtering is not applied twice. It is
 opt-in, uses a bounded queue and a separate sender thread, and cannot wait on the
 collector in the camera's normal publish path. Without the flag, the existing
 publisher follows its usual preprocessing and DDS publication. Tap errors are
@@ -169,21 +294,35 @@ skew, and stores RGB unregistered to depth with that limitation explicit.
 
 ## Depth, state, and overload semantics
 
-The default `training_bicubic` reproduces the deterministic tensor operations in
-training's `depth_mixin.py`: convert raw units to meters, clamp/normalize to
-0–3 m, crop with training endpoints (no extra bottom/right pixel), bicubic resize
-with `align_corners=False`, then clamp to [0,1]. Input is exactly float32 48×64.
-The 640×480 crop `[48,0,28,36]` scales the training 160×120 crop `[12,0,7,9]`.
-Synthetic training noise, rendered latency, and artifacts are not added to real
-sensor measurements. Matching these tensor operations does not certify the
-physical camera mounting or intrinsics; these must be checked against the
-training pose/FOV and are recorded where available.
+The examples now use `realsense_filters: true` and
+`preprocessing: deployment_tensor_only`, matching robot-control operations:
+hole filling (SDK default), spatial filtering (magnitude 5, alpha .75, delta 1,
+holes_fill 4), then temporal filtering (alpha .75, delta 1). The settings are
+shared with `rough_depth_image.py` through `common/realsense_filters.py`.
 
-`deployment_tensor_only` is an explicit alternative that reuses
-`common.depth_processing.preprocess_depth_array` (legacy crop endpoints and
-adaptive average pooling). It does **not** reproduce the separate stateful
-RealSense hole/spatial/temporal filters. The examples use training preprocessing;
-no hidden fallback or automatic interpolation change is applied.
+Filtered depth is passed to the same `preprocess_depth_array` used by control:
+convert sensor units to meters, normalize/clamp to 0–3 m, use the control crop
+endpoints (including its extra bottom/right pixel), and adaptive-average-pool to
+48×64. Rotation follows `rotate_180`. This replaces the previous example default
+of training-style bicubic resizing; old trial configurations remain unchanged.
+
+Both raw and filtered depth are saved. Replay and isolated benchmarks reconstruct
+tensor preprocessing from **saved filtered depth**, not by rerunning a temporal
+filter on a subsampled raw recording. RealSense filtering runs in the acquisition
+path, with `realsense_filter_ms` recorded separately from selector compute time.
+The isolated benchmark excludes RealSense filter execution; it measures the
+remaining tensor preprocessing, classifier and selector.
+
+Direct capture creates fresh filters per trial and updates them on every acquired
+camera frame. Shared-camera capture uses the existing publisher's filter history
+and cadence; it does not reset or change the controller's filters. Thus identical
+operations do not imply identical temporal history across the two capture modes.
+Use one capture mode consistently across compared trials. Restart the publisher
+between trials if your protocol requires its temporal filter history to reset.
+
+`training_bicubic` remains available explicitly for training-style crop/resize
+comparisons; `realsense_filters: false` preserves the unfiltered capture option.
+Physical camera mounting and intrinsics still require independent verification.
 
 State is the most recent low-state message received **at or before** depth host
 receipt, bounded by `max_state_age_s`. RPY is in radians; gyroscope is unscaled
@@ -257,7 +396,7 @@ python -m shadow_experiment.analyze report shadow_trials \
 ```
 
 Replay checks both model/sidecar hashes, resets every selector, reruns saved
-processed inputs, reconstructs preprocessing from raw input, and compares logits,
+processed inputs, reconstructs preprocessing from the saved raw or filtered input, and compares logits,
 probabilities, filtered distributions, pending EMA state, and proposed skills:
 
 ```bash

@@ -31,6 +31,9 @@ class ShadowTests(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.c = load_config(ROOT/'configs/shadow/rough_to_gap.yaml')
         self.c['output_root'] = self.tmp.name
+        self.c['runtime']['record_only'] = False
+        self.c['camera']['realsense_filters'] = False
+        self.c['camera']['preprocessing'] = 'training_bicubic'
         self.c['runtime'].update(update_hz=1000, max_input_age_s=10, chunk_frames=2)
         self.c['analysis']['max_contiguous_gap_s'] = 10
 
@@ -86,6 +89,91 @@ class ShadowTests(unittest.TestCase):
             self.assertIsNone(c.truth.event)
         finally:
             c.writer.close('test', c.truth, dict(c.counters))
+
+    def test_direct_camera_applies_control_filters_and_preserves_raw(self):
+        from shadow_experiment.collect import realsense_source
+        from unittest.mock import MagicMock
+        import threading
+        rs = MagicMock()
+        c = Mock()
+        c.config = copy.deepcopy(self.c)
+        c.config['camera']['realsense_filters'] = True
+        c.stop = threading.Event()
+        c.offer.side_effect = lambda *args: c.stop.set()
+        frame = Mock()
+        frame.get_frame_number.return_value = 1
+        frame.get_timestamp.return_value = 100.
+        raw = np.full((480,640),1000,np.uint16)
+        filtered = np.full_like(raw,2000)
+        frame.get_data.return_value = raw
+        pipeline = rs.pipeline.return_value
+        pipeline.wait_for_frames.return_value.get_depth_frame.return_value = frame
+        pipeline.start.return_value.get_device.return_value.first_depth_sensor.return_value.get_depth_scale.return_value = .001
+        hole = rs.hole_filling_filter.return_value
+        spatial = rs.spatial_filter.return_value
+        temporal = rs.temporal_filter.return_value
+        temporal.process.return_value.get_data.return_value = filtered
+        with patch.dict(sys.modules, {'pyrealsense2': rs}):
+            realsense_source(c)
+        hole.process.assert_called_once_with(frame)
+        spatial.process.assert_called_once_with(hole.process.return_value)
+        temporal.process.assert_called_once_with(spatial.process.return_value)
+        rs.config.return_value.enable_stream.assert_called_once_with(rs.stream.depth,640,480,rs.format.z16,30)
+        meta, saved_raw, rgb = c.offer.call_args.args
+        np.testing.assert_array_equal(saved_raw,raw)
+        np.testing.assert_array_equal(meta['_filtered_depth'],filtered)
+        self.assertGreaterEqual(meta['realsense_filter_ms'],0)
+        self.assertIsNone(rgb)
+        pipeline.stop.assert_called_once()
+
+    def test_record_only_uses_publisher_input_and_offline_inference(self):
+        from shadow_experiment.infer import infer
+        self.c['runtime']['record_only'] = True
+        with patch('shadow_experiment.collect.Pipelines', side_effect=AssertionError('online inference')), patch('shadow_experiment.collect.preprocess', side_effect=AssertionError('duplicate preprocessing')):
+            c = Collector(self.c)
+            stamp = time.monotonic_ns()
+            raw = np.full((480,640), 1500, np.uint16)
+            depth = preprocess(raw, .001, self.c['camera'])
+            c.states.add({'receipt_ns':stamp-1000000,'sensor_tick':1,'rpy':[0.,0.,0.],'omega':[0.,0.,0.]})
+            c.process({'frame_id':1,'receipt_ns':stamp,'sensor_timestamp_ms':100.,'depth_scale_m':.001,
+                       '_processed_depth':depth}, raw, None)
+            c.writer.close('test',c.truth,dict(c.counters))
+        _, rows, issues = read_trial(c.writer.path)
+        self.assertFalse(issues)
+        self.assertNotIn('selectors', rows[0][0])
+        np.testing.assert_array_equal(rows[0][1]['depth'], depth)
+        output = Path(self.tmp.name)/'derived'
+        infer(c.writer.path, output)
+        manifest, rows, issues = read_trial(output)
+        self.assertFalse(issues)
+        self.assertEqual(manifest['execution_mode'], 'offline_inference')
+        self.assertEqual(len(rows[0][0]['selectors']), 6)
+        self.assertTrue(replay(output)['consistent'])
+        self.assertRaises(FileExistsError, infer, c.writer.path, output)
+
+    def test_filtered_inputs_are_saved_and_replayed_with_control_resize(self):
+        from common.depth_processing import preprocess_depth_array
+        c = Collector(self.c)
+        c.config['camera']['realsense_filters'] = True
+        c.config['camera']['preprocessing'] = 'deployment_tensor_only'
+        # Recreate the writer after selecting the configuration, using a new ID.
+        c.writer.close('test_setup', c.truth, {})
+        c.config['trial_id'] = 'filtered'
+        c.writer = TrialWriter(c.config, c.pipelines.metadata, c.start_ns)
+        raw = np.zeros((480,640), np.uint16)
+        filtered = np.full_like(raw, 1500)
+        stamp = time.monotonic_ns()
+        c.states.add({'receipt_ns':stamp-1000000,'sensor_tick':1,'rpy':[0.,0.,0.],'omega':[0.,0.,0.]})
+        c.process({'frame_id':1,'receipt_ns':stamp,'sensor_timestamp_ms':100.,'depth_scale_m':.001,
+                   'rgb_timestamp_ms':None,'_filtered_depth':filtered},raw,None)
+        c.writer.close('test',c.truth,dict(c.counters))
+        _, rows, issues = read_trial(c.writer.path)
+        self.assertFalse(issues)
+        self.assertEqual(len(rows),1)
+        np.testing.assert_array_equal(rows[0][1]['raw_depth'],raw)
+        np.testing.assert_array_equal(rows[0][1]['filtered_depth'],filtered)
+        np.testing.assert_array_equal(rows[0][1]['depth'],preprocess_depth_array(filtered,.001))
+        self.assertTrue(replay(c.writer.path)['consistent'])
 
     def test_transition_latches_all_trigger_types(self):
         for trigger in ({'type':'time','seconds':1}, {'type':'operator','marker':'go'},
